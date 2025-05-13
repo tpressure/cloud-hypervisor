@@ -215,7 +215,7 @@ impl From<Error> for super::Error {
     }
 }
 
-pub fn get_x2apic_id(cpu_id: u32, topology: Option<(u8, u8, u8)>) -> u32 {
+pub fn get_x2apic_id(cpu_id: u32, topology: Option<(u32, u32, u32)>) -> u32 {
     if let Some(t) = topology {
         let thread_mask_width = u8::BITS - (t.0 - 1).leading_zeros();
         let core_mask_width = u8::BITS - (t.1 - 1).leading_zeros();
@@ -826,14 +826,14 @@ pub fn generate_common_cpuid(
 
 pub fn configure_vcpu(
     vcpu: &Arc<dyn hypervisor::Vcpu>,
-    id: u8,
+    id: u32,
     boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemoryMmap>)>,
     cpuid: Vec<CpuIdEntry>,
     kvm_hyperv: bool,
     cpu_vendor: CpuVendor,
-    topology: Option<(u8, u8, u8)>,
+    topology: Option<(u32, u32, u32)>,
 ) -> super::Result<()> {
-    let x2apic_id = get_x2apic_id(id as u32, topology);
+    let x2apic_id = get_x2apic_id(id, topology);
 
     // Per vCPU CPUID changes; common are handled via generate_common_cpuid()
     let mut cpuid = cpuid;
@@ -952,14 +952,14 @@ pub fn configure_system(
     cmdline_addr: GuestAddress,
     cmdline_size: usize,
     initramfs: &Option<InitramfsConfig>,
-    _num_cpus: u8,
+    _num_cpus: u32,
     setup_header: Option<setup_header>,
     rsdp_addr: Option<GuestAddress>,
     sgx_epc_region: Option<SgxEpcRegion>,
     serial_number: Option<&str>,
     uuid: Option<&str>,
     oem_strings: Option<&[&str]>,
-    topology: Option<(u8, u8, u8)>,
+    topology: Option<(u32, u32, u32)>,
 ) -> super::Result<()> {
     // Write EBDA address to location where ACPICA expects to find it
     guest_mem
@@ -1367,11 +1367,11 @@ pub fn get_host_cpu_phys_bits(hypervisor: &Arc<dyn hypervisor::Hypervisor>) -> u
 
 fn update_cpuid_topology(
     cpuid: &mut Vec<CpuIdEntry>,
-    threads_per_core: u8,
-    cores_per_die: u8,
-    dies_per_package: u8,
+    threads_per_core: u32,
+    cores_per_die: u32,
+    dies_per_package: u32,
     cpu_vendor: CpuVendor,
-    id: u8,
+    id: u32,
 ) {
     let x2apic_id = get_x2apic_id(
         id as u32,

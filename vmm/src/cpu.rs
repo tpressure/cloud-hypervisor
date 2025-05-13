@@ -338,7 +338,7 @@ macro_rules! round_up {
 pub struct Vcpu {
     // The hypervisor abstracted CPU.
     vcpu: Arc<dyn hypervisor::Vcpu>,
-    id: u8,
+    id: u32,
     #[cfg(target_arch = "aarch64")]
     mpidr: u64,
     saved_state: Option<CpuState>,
@@ -356,8 +356,8 @@ impl Vcpu {
     /// * `vm_ops` - Optional object for exit handling.
     /// * `cpu_vendor` - CPU vendor as reported by __cpuid(0x0)
     pub fn new(
-        id: u8,
-        apic_id: u8,
+        id: u32,
+        apic_id: u32,
         vm: &Arc<dyn hypervisor::Vm>,
         vm_ops: Option<Arc<dyn VmOps>>,
         #[cfg(target_arch = "x86_64")] cpu_vendor: CpuVendor,
@@ -390,7 +390,7 @@ impl Vcpu {
         boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemoryMmap>)>,
         #[cfg(target_arch = "x86_64")] cpuid: Vec<CpuIdEntry>,
         #[cfg(target_arch = "x86_64")] kvm_hyperv: bool,
-        #[cfg(target_arch = "x86_64")] topology: Option<(u8, u8, u8)>,
+        #[cfg(target_arch = "x86_64")] topology: Option<(u32, u32, u32)>,
     ) -> Result<()> {
         #[cfg(target_arch = "aarch64")]
         {
@@ -526,14 +526,14 @@ pub struct CpuManager {
     #[cfg(feature = "guest_debug")]
     vm_debug_evt: EventFd,
     vcpu_states: Vec<VcpuState>,
-    selected_cpu: u8,
+    selected_cpu: u32,
     vcpus: Vec<Arc<Mutex<Vcpu>>>,
     seccomp_action: SeccompAction,
     vm_ops: Arc<dyn VmOps>,
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
     acpi_address: Option<GuestAddress>,
-    proximity_domain_per_cpu: BTreeMap<u8, u32>,
-    affinity: BTreeMap<u8, Vec<usize>>,
+    proximity_domain_per_cpu: BTreeMap<u32, u32>,
+    affinity: BTreeMap<u32, Vec<usize>>,
     dynamic: bool,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     #[cfg(feature = "sev_snp")]
@@ -555,11 +555,13 @@ impl BusDevice for CpuManager {
 
         match offset {
             CPU_SELECTION_OFFSET => {
-                data[0] = self.selected_cpu;
+                //  data[0] = self.selected_cpu;
+                data.copy_from_slice(&self.selected_cpu.to_ne_bytes());
             }
+
             CPU_STATUS_OFFSET => {
                 if self.selected_cpu < self.max_vcpus() {
-                    let state = &self.vcpu_states[usize::from(self.selected_cpu)];
+                    let state = &self.vcpu_states[self.selected_cpu as usize];
                     if state.active() {
                         data[0] |= 1 << CPU_ENABLE_FLAG;
                     }
@@ -585,11 +587,13 @@ impl BusDevice for CpuManager {
     fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
         match offset {
             CPU_SELECTION_OFFSET => {
-                self.selected_cpu = data[0];
+                let mut selected_cpu = [0u8; 4];
+                selected_cpu.copy_from_slice(data);
+                self.selected_cpu = u32::from_ne_bytes(selected_cpu);
             }
             CPU_STATUS_OFFSET => {
                 if self.selected_cpu < self.max_vcpus() {
-                    let state = &mut self.vcpu_states[usize::from(self.selected_cpu)];
+                    let state = &mut self.vcpu_states[self.selected_cpu as usize];
                     // The ACPI code writes back a 1 to acknowledge the insertion
                     if (data[0] & (1 << CPU_INSERTING_FLAG) == 1 << CPU_INSERTING_FLAG)
                         && state.inserting
@@ -692,8 +696,11 @@ impl CpuManager {
             return Err(Error::MaximumVcpusExceeded);
         }
 
-        let mut vcpu_states = Vec::with_capacity(usize::from(config.max_vcpus));
-        vcpu_states.resize_with(usize::from(config.max_vcpus), VcpuState::default);
+        let mut vcpu_states = Vec::with_capacity(config.max_vcpus as usize);
+        //  let mut vcpu_states = Vec::with_capacity(usize::from(config.max_vcpus));
+        vcpu_states.resize_with(config.max_vcpus as usize, VcpuState::default);
+        //  vcpu_states.resize_with(usize::from(config.max_vcpus), VcpuState::default);
+
         let hypervisor_type = hypervisor.hypervisor_type();
         #[cfg(target_arch = "x86_64")]
         let cpu_vendor = hypervisor.get_cpu_vendor();
@@ -730,7 +737,7 @@ impl CpuManager {
             }
         }
 
-        let proximity_domain_per_cpu: BTreeMap<u8, u32> = {
+        let proximity_domain_per_cpu: BTreeMap<u32, u32> = {
             let mut cpu_list = Vec::new();
             for (proximity_domain, numa_node) in numa_nodes.iter() {
                 for cpu in numa_node.cpus.iter() {
@@ -771,7 +778,7 @@ impl CpuManager {
             #[cfg(feature = "guest_debug")]
             vm_debug_evt,
             selected_cpu: 0,
-            vcpus: Vec::with_capacity(usize::from(config.max_vcpus)),
+            vcpus: Vec::with_capacity(config.max_vcpus as usize),
             seccomp_action,
             vm_ops,
             acpi_address: None,
@@ -817,7 +824,7 @@ impl CpuManager {
         Ok(())
     }
 
-    fn create_vcpu(&mut self, cpu_id: u8, snapshot: Option<Snapshot>) -> Result<Arc<Mutex<Vcpu>>> {
+    fn create_vcpu(&mut self, cpu_id: u32, snapshot: Option<Snapshot>) -> Result<Arc<Mutex<Vcpu>>> {
         info!("Creating vCPU: cpu_id = {}", cpu_id);
 
         #[cfg(target_arch = "x86_64")]
@@ -829,7 +836,7 @@ impl CpuManager {
 
         let mut vcpu = Vcpu::new(
             cpu_id,
-            x2apic_id as u8,
+            x2apic_id,
             &self.vm,
             Some(self.vm_ops.clone()),
             #[cfg(target_arch = "x86_64")]
@@ -907,7 +914,7 @@ impl CpuManager {
     /// Only create new vCPUs if there aren't any inactive ones to reuse
     fn create_vcpus(
         &mut self,
-        desired_vcpus: u8,
+        desired_vcpus: u32,
         snapshot: Option<Snapshot>,
     ) -> Result<Vec<Arc<Mutex<Vcpu>>>> {
         let mut vcpus: Vec<Arc<Mutex<Vcpu>>> = vec![];
@@ -924,7 +931,7 @@ impl CpuManager {
         }
 
         // Only create vCPUs in excess of all the allocated vCPUs.
-        for cpu_id in self.vcpus.len() as u8..desired_vcpus {
+        for cpu_id in self.vcpus.len() as u32..desired_vcpus {
             vcpus.push(self.create_vcpu(
                 cpu_id,
                 // TODO: The special format of the CPU id can be removed once
@@ -962,7 +969,7 @@ impl CpuManager {
     fn start_vcpu(
         &mut self,
         vcpu: Arc<Mutex<Vcpu>>,
-        vcpu_id: u8,
+        vcpu_id: u32,
         vcpu_thread_barrier: Arc<Barrier>,
         inserting: bool,
     ) -> Result<()> {
@@ -977,12 +984,12 @@ impl CpuManager {
         let vcpu_pause_signalled = self.vcpus_pause_signalled.clone();
         let vcpu_kick_signalled = self.vcpus_kick_signalled.clone();
 
-        let vcpu_kill = self.vcpu_states[usize::from(vcpu_id)].kill.clone();
-        let vcpu_run_interrupted = self.vcpu_states[usize::from(vcpu_id)]
+        let vcpu_kill = self.vcpu_states[vcpu_id as usize].kill.clone();
+        let vcpu_run_interrupted = self.vcpu_states[vcpu_id as usize]
             .vcpu_run_interrupted
             .clone();
         let panic_vcpu_run_interrupted = vcpu_run_interrupted.clone();
-        let vcpu_paused = self.vcpu_states[usize::from(vcpu_id)].paused.clone();
+        let vcpu_paused = self.vcpu_states[vcpu_id as usize].paused.clone();
 
         // Prepare the CPU set the current vCPU is expected to run onto.
         let cpuset = self.affinity.get(&vcpu_id).map(|host_cpus| {
@@ -1213,8 +1220,8 @@ impl CpuManager {
 
         // On hot plug calls into this function entry_point is None. It is for
         // those hotplug CPU additions that we need to set the inserting flag.
-        self.vcpu_states[usize::from(vcpu_id)].handle = handle;
-        self.vcpu_states[usize::from(vcpu_id)].inserting = inserting;
+        self.vcpu_states[vcpu_id as usize].handle = handle;
+        self.vcpu_states[vcpu_id as usize].inserting = inserting;
 
         Ok(())
     }
@@ -1222,7 +1229,7 @@ impl CpuManager {
     /// Start up as many vCPUs threads as needed to reach `desired_vcpus`
     fn activate_vcpus(
         &mut self,
-        desired_vcpus: u8,
+        desired_vcpus: u32,
         inserting: bool,
         paused: Option<bool>,
     ) -> Result<()> {
@@ -1257,11 +1264,11 @@ impl CpuManager {
         Ok(())
     }
 
-    fn mark_vcpus_for_removal(&mut self, desired_vcpus: u8) {
+    fn mark_vcpus_for_removal(&mut self, desired_vcpus: u32) {
         // Mark vCPUs for removal, actual removal happens on ejection
         for cpu_id in desired_vcpus..self.present_vcpus() {
-            self.vcpu_states[usize::from(cpu_id)].removing = true;
-            self.vcpu_states[usize::from(cpu_id)]
+            self.vcpu_states[cpu_id as usize].removing = true;
+            self.vcpu_states[cpu_id as usize]
                 .pending_removal
                 .store(true, Ordering::SeqCst);
         }
@@ -1276,9 +1283,9 @@ impl CpuManager {
         false
     }
 
-    fn remove_vcpu(&mut self, cpu_id: u8) -> Result<()> {
+    fn remove_vcpu(&mut self, cpu_id: u32) -> Result<()> {
         info!("Removing vCPU: cpu_id = {}", cpu_id);
-        let state = &mut self.vcpu_states[usize::from(cpu_id)];
+        let state = &mut self.vcpu_states[cpu_id as usize];
         state.kill.store(true, Ordering::SeqCst);
         state.signal_thread();
         state.join_thread()?;
@@ -1306,7 +1313,7 @@ impl CpuManager {
     }
 
     pub fn start_restored_vcpus(&mut self) -> Result<()> {
-        self.activate_vcpus(self.vcpus.len() as u8, false, Some(true))
+        self.activate_vcpus(self.vcpus.len() as u32, false, Some(true))
             .map_err(|e| {
                 Error::StartRestoreVcpu(anyhow!("Failed to start restored vCPUs: {:#?}", e))
             })?;
@@ -1314,7 +1321,7 @@ impl CpuManager {
         Ok(())
     }
 
-    pub fn resize(&mut self, desired_vcpus: u8) -> Result<bool> {
+    pub fn resize(&mut self, desired_vcpus: u32) -> Result<bool> {
         if desired_vcpus.cmp(&self.present_vcpus()) == cmp::Ordering::Equal {
             return Ok(false);
         }
@@ -1387,11 +1394,11 @@ impl CpuManager {
         Ok(())
     }
 
-    pub fn boot_vcpus(&self) -> u8 {
+    pub fn boot_vcpus(&self) -> u32 {
         self.config.boot_vcpus
     }
 
-    pub fn max_vcpus(&self) -> u8 {
+    pub fn max_vcpus(&self) -> u32 {
         self.config.max_vcpus
     }
 
@@ -1401,10 +1408,10 @@ impl CpuManager {
         self.cpuid.clone()
     }
 
-    fn present_vcpus(&self) -> u8 {
+    fn present_vcpus(&self) -> u32 {
         self.vcpu_states
             .iter()
-            .fold(0, |acc, state| acc + state.active() as u8)
+            .fold(0, |acc, state| acc + state.active() as u32)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -1423,7 +1430,7 @@ impl CpuManager {
             .collect()
     }
 
-    pub fn get_vcpu_topology(&self) -> Option<(u8, u8, u8)> {
+    pub fn get_vcpu_topology(&self) -> Option<(u32, u32, u32)> {
         self.config
             .topology
             .clone()
@@ -1922,11 +1929,11 @@ impl CpuManager {
 }
 
 struct Cpu {
-    cpu_id: u8,
+    cpu_id: u32,
     proximity_domain: u32,
     dynamic: bool,
     #[cfg(target_arch = "x86_64")]
-    topology: Option<(u8, u8, u8)>,
+    topology: Option<(u32, u32, u32)>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2045,7 +2052,7 @@ impl Aml for Cpu {
 }
 
 struct CpuNotify {
-    cpu_id: u8,
+    cpu_id: u32,
 }
 
 impl Aml for CpuNotify {
@@ -2060,7 +2067,7 @@ impl Aml for CpuNotify {
 }
 
 struct CpuMethods {
-    max_vcpus: u8,
+    max_vcpus: u32,
     dynamic: bool,
 }
 
@@ -2098,7 +2105,7 @@ impl Aml for CpuMethods {
 
             let mut cpu_notifies_refs: Vec<&dyn Aml> = Vec::new();
             for cpu_id in 0..self.max_vcpus {
-                cpu_notifies_refs.push(&cpu_notifies[usize::from(cpu_id)]);
+                cpu_notifies_refs.push(&cpu_notifies[cpu_id as usize]);
             }
 
             aml::Method::new("CTFY".into(), 2, true, cpu_notifies_refs).to_aml_bytes(sink);
