@@ -85,7 +85,7 @@ fn set_remote_irr(entry: &mut RedirectionTableEntry, val: u8) {
 }
 
 pub const NUM_IOAPIC_PINS: usize = 24;
-const IOAPIC_VERSION_ID: u32 = 0x0017_0011;
+const IOAPIC_VERSION_ID: u32 = 0x0017_0020;
 
 // Constants for IOAPIC direct register offset
 const IOAPIC_REG_ID: u8 = 0x00;

@@ -1378,9 +1378,9 @@ fn update_cpuid_topology(
         Some((threads_per_core, cores_per_die, dies_per_package)),
     );
 
-    let thread_width = 8 - (threads_per_core - 1).leading_zeros();
-    let core_width = (8 - (cores_per_die - 1).leading_zeros()) + thread_width;
-    let die_width = (8 - (dies_per_package - 1).leading_zeros()) + core_width;
+    let thread_width = 32 - (threads_per_core - 1).leading_zeros();
+    let core_width = (32 - (cores_per_die - 1).leading_zeros()) + thread_width;
+    let die_width = (32 - (dies_per_package - 1).leading_zeros()) + core_width;
 
     let mut cpu_ebx = CpuidPatch::get_cpuid_reg(cpuid, 0x1, None, CpuidReg::EBX).unwrap_or(0);
     cpu_ebx |= ((dies_per_package as u32) * (cores_per_die as u32) * (threads_per_core as u32))
