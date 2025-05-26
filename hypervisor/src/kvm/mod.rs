@@ -53,7 +53,7 @@ pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::{
     kvm_enable_cap, kvm_msr_entry, MsrList, KVM_CAP_HYPERV_SYNIC, KVM_CAP_SPLIT_IRQCHIP,
-    KVM_GUESTDBG_USE_HW_BP,
+    KVM_GUESTDBG_USE_HW_BP, KVM_CAP_X2APIC_API,
 };
 #[cfg(target_arch = "x86_64")]
 use x86_64::check_required_kvm_extensions;
@@ -829,6 +829,16 @@ impl vm::Vm for KvmVm {
         self.fd
             .enable_cap(&cap)
             .map_err(|e| vm::HypervisorVmError::EnableSplitIrq(e.into()))?;
+
+        let mut cap2 = kvm_enable_cap {
+            cap: KVM_CAP_X2APIC_API,
+            ..Default::default()
+        };
+        cap2.args[0] = 3 as u64;
+        self.fd
+            .enable_cap(&cap2)
+            .map_err(|e| vm::HypervisorVmError::EnableSplitIrq(e.into()))?;
+
         Ok(())
     }
 

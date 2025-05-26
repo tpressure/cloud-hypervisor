@@ -217,9 +217,9 @@ impl From<Error> for super::Error {
 
 pub fn get_x2apic_id(cpu_id: u32, topology: Option<(u32, u32, u32)>) -> u32 {
     if let Some(t) = topology {
-        let thread_mask_width = u8::BITS - (t.0 - 1).leading_zeros();
-        let core_mask_width = u8::BITS - (t.1 - 1).leading_zeros();
-        let die_mask_width = u8::BITS - (t.2 - 1).leading_zeros();
+        let thread_mask_width = u32::BITS - (t.0 - 1).leading_zeros();
+        let core_mask_width = u32::BITS - (t.1 - 1).leading_zeros();
+        let die_mask_width = u32::BITS - (t.2 - 1).leading_zeros();
 
         let thread_id = cpu_id % (t.0 as u32);
         let core_id = cpu_id / (t.0 as u32) % (t.1 as u32);
