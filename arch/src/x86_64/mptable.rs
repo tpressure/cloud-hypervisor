@@ -92,7 +92,7 @@ pub type Result<T> = result::Result<T, Error>;
 // With APIC/xAPIC, there are only 255 APIC IDs available. And IOAPIC occupies
 // one APIC ID, so only 254 CPUs at maximum may be supported. Actually it's
 // a large number for FC usecases.
-pub const MAX_SUPPORTED_CPUS: u32 = 254;
+pub const MAX_SUPPORTED_CPUS: u32 = 1024;
 
 // Most of these variables are sourced from the Intel MP Spec 1.4.
 const SMP_MAGIC_IDENT: &[c_uchar; 4] = b"_MP_";
