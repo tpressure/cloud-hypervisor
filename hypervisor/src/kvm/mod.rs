@@ -647,8 +647,14 @@ impl vm::Vm for KvmVm {
                     ..Default::default()
                 };
 
-                kvm_route.u.msi.address_lo = cfg.low_addr;
-                kvm_route.u.msi.address_hi = cfg.high_addr;
+                let mut address = ((cfg.high_addr as u64) << 32) | (cfg.low_addr as u64);
+                let ext_id = address & (0xff << 4);
+
+                address &= !ext_id;
+                address |= ext_id << 35;
+
+                kvm_route.u.msi.address_lo = (address & 0xFFFFFFFF) as u32;
+                kvm_route.u.msi.address_hi = (address >> 32) as u32;
                 kvm_route.u.msi.data = cfg.data;
 
                 if self.check_extension(crate::kvm::Cap::MsiDevid) {

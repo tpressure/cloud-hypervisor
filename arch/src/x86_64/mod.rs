@@ -56,6 +56,8 @@ const KVM_FEATURE_ASYNC_PF_BIT: u8 = 4;
 const KVM_FEATURE_ASYNC_PF_VMEXIT_BIT: u8 = 10;
 #[cfg(feature = "tdx")]
 const KVM_FEATURE_STEAL_TIME_BIT: u8 = 5;
+#[cfg(feature = "kvm")]
+const KVM_FEATURE_MSI_EXT_DEST_ID: u8 = 15;
 
 pub const _NSIG: i32 = 65;
 
@@ -641,6 +643,16 @@ pub fn generate_common_cpuid(
             ebx_bit: None,
             ecx_bit: None,
             edx_bit: Some(MTRR_EDX_BIT),
+        },
+        #[cfg(feature = "kvm")]
+        CpuidPatch {
+            function: 0x40000001,
+            index: 0,
+            flags_bit: None,
+            eax_bit: Some(KVM_FEATURE_MSI_EXT_DEST_ID),
+            ebx_bit: None,
+            ecx_bit: None,
+            edx_bit: None,
         },
     ];
 
