@@ -2274,7 +2274,15 @@ impl Aml for CpuManager {
 impl Pausable for CpuManager {
     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
         // Tell the vCPUs to pause themselves next time they exit
-        self.vcpus_pause_signalled.store(true, Ordering::SeqCst);
+        let old = self.vcpus_pause_signalled.swap(true, Ordering::SeqCst);
+        if old {
+            // Make pause() idempotent. This is helpful when the migration
+            // thread wants to stop the vCPUS but the vCPU throttle thread
+            // also just performed a .pause(). We don't use strong
+            // synchronization between these threads in all cases, as every
+            // ms counts for the migration thread to reach a low downtime.
+            return Ok(());
+        }
 
         // Signal to the spawned threads (vCPUs and console signal handler). For the vCPU threads
         // this will interrupt the KVM_RUN ioctl() allowing the loop to check the boolean set
