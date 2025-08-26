@@ -101,7 +101,10 @@ impl ThrottleWorker {
         let cb_duration = begin.elapsed();
 
         if cb_duration.as_millis() > Self::TIMESLICE_MS as u128 {
-            warn!("timeslice should be no longer than pausing/resuming all vCPUs!");
+            warn!(
+                "timeslice should be no longer than pausing/resuming all vCPUs! took {} ms",
+                cb_duration.as_millis()
+            );
         }
 
         let sleep_duration = target_duration.saturating_sub(cb_duration);
