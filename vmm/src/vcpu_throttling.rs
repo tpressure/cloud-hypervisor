@@ -167,7 +167,7 @@ impl ThrottleWorker {
         F: Fn(),
     {
         if (*current_throttle == 99) {
-            info!("Throttle is 99");
+            info!("Throttle is 99 duration:{}ms", duration.as_millis());
         }
         let maybe_task =
             Self::execute_and_wait_interruptible(callback, duration, receiver, is_pause);
