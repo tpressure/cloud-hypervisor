@@ -1149,6 +1149,11 @@ impl CpuManager {
                             // loads and stores to different atomics and we need
                             // to see them in a consistent order in all threads
 
+
+                            if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+                                info!("going to load vcpu_pause_signalled on vcpu {}", vcpu_id);
+                            }
+
                             if vcpu_pause_signalled.load(Ordering::SeqCst) {
                                 // As a pause can be caused by PIO & MMIO exits then we need to ensure they are
                                 // completed by returning to KVM_RUN. From the kernel docs:
@@ -1177,6 +1182,9 @@ impl CpuManager {
 
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
 
+                                if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+                                    info!("setting vcpu_paused to true on vcpu {}", vcpu_id);
+                                }
                                 vcpu_paused.store(true, Ordering::SeqCst);
                                 while vcpu_pause_signalled.load(Ordering::SeqCst) {
                                     if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
@@ -2451,6 +2459,9 @@ impl Pausable for CpuManager {
         }
 
         // Toggle the vCPUs pause boolean
+        if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("setting vcpu_pause_signalled to false");
+        }
         self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
 
         // Unpark all the VCPU threads.
@@ -2458,6 +2469,9 @@ impl Pausable for CpuManager {
         // boolean. Since it'll be set to false, they will exit their pause loop
         // and go back to vmx root.
         for (vcpu_id, state) in self.vcpu_states.iter().enumerate() {
+            if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+                info!("setting vcpu_paused to false on vcpu {}", vcpu_id);
+            }
             state.paused.store(false, Ordering::SeqCst);
             if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
                 info!("unparking cpu {}", vcpu_id);
