@@ -2373,15 +2373,13 @@ impl Aml for CpuManager {
 
 impl Pausable for CpuManager {
     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
-<<<<<<< HEAD
         assert_eq!(self.current_state_transition, None);
         self.current_state_transition = Some(StateTransition::Pausing);
 
-=======
         if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
             info!("pause begin");
         }
->>>>>>> 3398d83da (xxx)
+
         // Tell the vCPUs to pause themselves next time they exit
         let old = self.vcpus_pause_signalled.swap(true, Ordering::SeqCst);
         if old {
@@ -2466,14 +2464,12 @@ impl Pausable for CpuManager {
             }
             state.unpark_thread();
         }
-<<<<<<< HEAD
 
         self.current_state_transition = None;
-=======
         if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
             info!("resume end");
         }
->>>>>>> 3398d83da (xxx)
+
         Ok(())
     }
 }
