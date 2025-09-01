@@ -1459,7 +1459,8 @@ impl CpuManager {
         self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
 
         // Unpark all the VCPU threads.
-        for state in self.vcpu_states.iter() {
+        for (vcpu_id, state) in self.vcpu_states.iter().enumerate() {
+            info!("shutdown and unparking cpu {}", vcpu_id);
             state.unpark_thread();
         }
 
@@ -2439,8 +2440,9 @@ impl Pausable for CpuManager {
         // Once unparked, the next thing they will do is checking for the pause
         // boolean. Since it'll be set to false, they will exit their pause loop
         // and go back to vmx root.
-        for state in self.vcpu_states.iter() {
+        for (vcpu_id, state) in self.vcpu_states.iter().enumerate() {
             state.paused.store(false, Ordering::SeqCst);
+            info!("unparking cpu {}", vcpu_id);
             state.unpark_thread();
         }
 
