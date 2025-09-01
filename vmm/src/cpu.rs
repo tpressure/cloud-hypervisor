@@ -19,7 +19,7 @@ use std::mem::size_of;
 use std::os::fd::RawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::{cmp, io, result, thread};
 
 #[cfg(not(target_arch = "riscv64"))]
@@ -75,6 +75,8 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::{register_signal_handler, SIGRTMIN};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
+
+static RESUME_LOCK: RwLock<()> = RwLock::new(());
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
@@ -1145,6 +1147,8 @@ impl CpuManager {
                             // loads and stores to different atomics and we need
                             // to see them in a consistent order in all threads
 
+
+                            let resume_lock = RESUME_LOCK.read().unwrap();
                             if vcpu_pause_signalled.load(Ordering::SeqCst) {
                                 // As a pause can be caused by PIO & MMIO exits then we need to ensure they are
                                 // completed by returning to KVM_RUN. From the kernel docs:
@@ -1160,6 +1164,8 @@ impl CpuManager {
                                 // guest with an unmasked signal pending or with the immediate_exit field set
                                 // to complete pending operations without allowing any further instructions
                                 // to be executed.
+
+
 
                                 #[cfg(feature = "kvm")]
                                 if matches!(hypervisor_type, HypervisorType::Kvm) {
@@ -1179,6 +1185,7 @@ impl CpuManager {
                                 }
                                 vcpu_run_interrupted.store(false, Ordering::SeqCst);
                             }
+                            drop(resume_lock);
 
                             if vcpu_kick_signalled.load(Ordering::SeqCst) {
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
@@ -2405,6 +2412,8 @@ impl Pausable for CpuManager {
     }
 
     fn resume(&mut self) -> std::result::Result<(), MigratableError> {
+        let resume_lock = RESUME_LOCK.write().unwrap();
+
         assert_eq!(self.current_state_transition, None);
         self.current_state_transition = Some(StateTransition::Resuming);
 
@@ -2423,6 +2432,8 @@ impl Pausable for CpuManager {
             state.paused.store(false, Ordering::SeqCst);
             state.unpark_thread();
         }
+
+        drop(resume_lock);
 
         self.current_state_transition = None;
         Ok(())
