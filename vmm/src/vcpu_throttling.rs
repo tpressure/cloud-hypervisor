@@ -166,6 +166,9 @@ impl ThrottleWorker {
     where
         F: Fn(),
     {
+        if (*current_throttle == 99) {
+            info!("Throttle is 99");
+        }
         let maybe_task =
             Self::execute_and_wait_interruptible(callback, duration, receiver, is_pause);
         match maybe_task {
@@ -178,6 +181,7 @@ impl ThrottleWorker {
                 None
             }
             Some(cmd @ (ThrottleCommand::Exiting | ThrottleCommand::Waiting)) => {
+                info!("ThrottleCommand::Exiting");
                 pre_break();
                 Some(cmd)
             }
