@@ -73,7 +73,7 @@ impl ThrottleWorker {
     /// |     50 % |          50 ms |           50 ms |
     /// |     90 % |          90 ms |           10 ms |
     /// |     99 % |          99 ms |            1 ms |
-    const TIMESLICE_MS: u64 = 100;
+    const TIMESLICE_MS: u64 = 500;
 
     /// This should not be named "vcpu*" as libvirt fails when
     /// iterating the vCPU threads then. Fix this first in libvirt!
