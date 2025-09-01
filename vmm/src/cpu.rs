@@ -2442,7 +2442,9 @@ impl Pausable for CpuManager {
         // and go back to vmx root.
         for (vcpu_id, state) in self.vcpu_states.iter().enumerate() {
             state.paused.store(false, Ordering::SeqCst);
-            info!("unparking cpu {}", vcpu_id);
+            if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+                info!("unparking cpu {}", vcpu_id);
+            }
             state.unpark_thread();
         }
 
