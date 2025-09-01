@@ -1169,7 +1169,7 @@ impl CpuManager {
                                         error!("Unexpected VM exit on \"immediate_exit\" run");
                                         break;
                                     }
-                                    vcpu.lock().as_ref().unwrap().vcpu.set_immediate_exit(false);
+                                    //  vcpu.lock().as_ref().unwrap().vcpu.set_immediate_exit(false);
                                 }
 
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
