@@ -1166,7 +1166,8 @@ impl Vmm {
 
         loop {
             // todo: check if auto-converge is enabled at all?
-            if Self::can_increase_autoconverge_step(s) {
+            if Self::can_increase_autoconverge_step(s) && vm.throttle_percent() < AUTO_CONVERGE_MAX
+            {
                 let current_throttle = vm.throttle_percent();
                 let new_throttle = current_throttle + AUTO_CONVERGE_STEP_SIZE;
                 let new_throttle = std::cmp::min(new_throttle, AUTO_CONVERGE_MAX);
@@ -1200,6 +1201,10 @@ impl Vmm {
                 .iter()
                 .map(|range| range.length)
                 .sum();
+            
+            if vm.throttle_percent() == AUTO_CONVERGE_MAX {
+                info!("throttle=99%, pending= {} MiB, throughput: {} MB/s", s.pending_size, s.mb_per_sec);
+            }
 
             // Update thresholds
             if bandwidth > 0.0 {

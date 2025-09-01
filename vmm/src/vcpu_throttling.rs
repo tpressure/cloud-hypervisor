@@ -95,15 +95,18 @@ impl ThrottleWorker {
         callback: &impl Fn(),
         target_duration: Duration,
         receiver: &mpsc::Receiver<ThrottleCommand>,
+        is_pause: bool,
     ) -> Option<ThrottleCommand> {
         let begin = Instant::now();
         callback();
         let cb_duration = begin.elapsed();
 
+        let action = if is_pause { "pausing" } else { "resuming" };
         if cb_duration.as_millis() > Self::TIMESLICE_MS as u128 {
             warn!(
-                "timeslice should be no longer than pausing/resuming all vCPUs! took {} ms",
-                cb_duration.as_millis()
+                "timeslice ({} ms) should be no longer than {action} all vCPUs! took {} ms",
+                Self::TIMESLICE_MS,
+                cb_duration.as_millis(),
             );
         }
 
@@ -158,11 +161,13 @@ impl ThrottleWorker {
         receiver: &mpsc::Receiver<ThrottleCommand>,
         current_throttle: &mut u64,
         pre_break: impl FnOnce(),
+        is_pause: bool,
     ) -> Option<ThrottleCommand>
     where
         F: Fn(),
     {
-        let maybe_task = Self::execute_and_wait_interruptible(callback, duration, receiver);
+        let maybe_task =
+            Self::execute_and_wait_interruptible(callback, duration, receiver, is_pause);
         match maybe_task {
             None => None,
             Some(ThrottleCommand::Throttling(next)) => {
@@ -211,6 +216,7 @@ impl ThrottleWorker {
                 // performs .pause() right after anyway. We could make .pause() and
                 // .resume() idempotent.
                 callback_resume_vcpus,
+                true,
             ) {
                 // We only exit here in case if ThrottleCommand::Waiting or ::Exiting
                 return cmd;
@@ -223,6 +229,7 @@ impl ThrottleWorker {
                 receiver,
                 &mut current_throttle,
                 || {},
+                false,
             ) {
                 // We only exit here in case if ThrottleCommand::Waiting or ::Exiting
                 return cmd;
