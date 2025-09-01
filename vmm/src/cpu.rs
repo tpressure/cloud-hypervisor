@@ -97,6 +97,7 @@ unsafe impl<T> Send for SafeWrapper<T> {}
 unsafe impl<T> Sync for SafeWrapper<T> {}
 
 static STATIC_VCPUS: Mutex<Vec<(u8 /* ID*/, SafeWrapper<*mut kvm_run>)>> = Mutex::new(vec![]);
+use crate::THROTTLE_99;
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
