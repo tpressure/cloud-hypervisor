@@ -19,7 +19,7 @@ use std::mem::size_of;
 use std::os::fd::RawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex, RwLock};
+use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result, thread};
 
 #[cfg(not(target_arch = "riscv64"))]
@@ -75,8 +75,6 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::{register_signal_handler, SIGRTMIN};
 use zerocopy::{FromBytes, Immutable, IntoBytes};
-
-static RESUME_LOCK: RwLock<()> = RwLock::new(());
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
@@ -523,12 +521,6 @@ impl Snapshottable for Vcpu {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum StateTransition {
-    Pausing,
-    Resuming,
-}
-
 pub struct CpuManager {
     config: CpusConfig,
     #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
@@ -558,7 +550,6 @@ pub struct CpuManager {
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     #[cfg(feature = "sev_snp")]
     sev_snp_enabled: bool,
-    current_state_transition: Option<StateTransition>,
 }
 
 const CPU_ENABLE_FLAG: usize = 0;
@@ -818,7 +809,6 @@ impl CpuManager {
             hypervisor: hypervisor.clone(),
             #[cfg(feature = "sev_snp")]
             sev_snp_enabled,
-            current_state_transition: None,
         })))
     }
 
@@ -1148,7 +1138,6 @@ impl CpuManager {
                             // to see them in a consistent order in all threads
 
 
-                            let resume_lock = RESUME_LOCK.read().unwrap();
                             if vcpu_pause_signalled.load(Ordering::SeqCst) {
                                 // As a pause can be caused by PIO & MMIO exits then we need to ensure they are
                                 // completed by returning to KVM_RUN. From the kernel docs:
@@ -1179,13 +1168,15 @@ impl CpuManager {
 
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
 
+                                //let resume_lock = RESUME_LOCK.read().unwrap();
                                 vcpu_paused.store(true, Ordering::SeqCst);
                                 while vcpu_pause_signalled.load(Ordering::SeqCst) {
                                     thread::park();
                                 }
+                                vcpu_paused.store(false, Ordering::SeqCst);
+                                //drop(resume_lock);
                                 vcpu_run_interrupted.store(false, Ordering::SeqCst);
                             }
-                            drop(resume_lock);
 
                             if vcpu_kick_signalled.load(Ordering::SeqCst) {
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
@@ -2366,9 +2357,6 @@ impl Aml for CpuManager {
 
 impl Pausable for CpuManager {
     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
-        assert_eq!(self.current_state_transition, None);
-        self.current_state_transition = Some(StateTransition::Pausing);
-
         // Tell the vCPUs to pause themselves next time they exit
         let old = self.vcpus_pause_signalled.swap(true, Ordering::SeqCst);
         if old {
@@ -2400,6 +2388,7 @@ impl Pausable for CpuManager {
         // activated vCPU change their state to ensure they have parked.
         for state in self.vcpu_states.iter() {
             if state.active() {
+                // wait for vCPU to update state
                 while !state.paused.load(Ordering::SeqCst) {
                     // To avoid a priority inversion with the vCPU thread
                     thread::sleep(std::time::Duration::from_millis(1));
@@ -2407,35 +2396,32 @@ impl Pausable for CpuManager {
             }
         }
 
-        self.current_state_transition = None;
         Ok(())
     }
 
     fn resume(&mut self) -> std::result::Result<(), MigratableError> {
-        let resume_lock = RESUME_LOCK.write().unwrap();
-
-        assert_eq!(self.current_state_transition, None);
-        self.current_state_transition = Some(StateTransition::Resuming);
-
-        for vcpu in self.vcpus.iter() {
-            vcpu.lock().unwrap().resume()?;
-        }
-
-        // Toggle the vCPUs pause boolean
+        // Ensure that vCPUs keep running after being unpark() in
+        // their run vCPU loop.
         self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
 
-        // Unpark all the VCPU threads.
-        // Once unparked, the next thing they will do is checking for the pause
-        // boolean. Since it'll be set to false, they will exit their pause loop
-        // and go back to vmx root.
-        for state in self.vcpu_states.iter() {
-            state.paused.store(false, Ordering::SeqCst);
-            state.unpark_thread();
+        // Unpark all the vCPU threads.
+        // Step 1/2: signal each thread
+        {
+            for state in self.vcpu_states.iter() {
+                state.unpark_thread();
+            }
+        }
+        // Step 2/2: wait for state ACK
+        {
+            for state in self.vcpu_states.iter() {
+                // wait for vCPU to update state
+                while state.paused.load(Ordering::SeqCst) {
+                    // To avoid a priority inversion with the vCPU thread
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
         }
 
-        drop(resume_lock);
-
-        self.current_state_transition = None;
         Ok(())
     }
 }
