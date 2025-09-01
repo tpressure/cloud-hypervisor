@@ -679,7 +679,7 @@ impl VcpuState {
                 } else {
                     // This is more effective than thread::yield_now() at
                     // avoiding a priority inversion with the vCPU thread
-                    thread::sleep(std::time::Duration::from_millis(1));
+                    thread::sleep(std::time::Duration::from_micros(1));
                 }
             }
         }
@@ -2391,7 +2391,7 @@ impl Pausable for CpuManager {
                 // wait for vCPU to update state
                 while !state.paused.load(Ordering::SeqCst) {
                     // To avoid a priority inversion with the vCPU thread
-                    thread::sleep(std::time::Duration::from_millis(1));
+                    thread::sleep(std::time::Duration::from_micros(1));
                 }
             }
         }
