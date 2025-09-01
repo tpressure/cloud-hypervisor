@@ -87,3 +87,5 @@ vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = { workspace = true, features = ["with-serde"] }
 zbus = { version = "5.7.1", optional = true }
 zerocopy = { workspace = true, features = ["alloc", "derive"] }
+kvm-bindings = "0.10.0"
+kvm-ioctls = "0.19.1"

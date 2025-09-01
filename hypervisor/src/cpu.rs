@@ -10,6 +10,7 @@
 //
 //
 
+use std::os::fd::RawFd;
 #[cfg(target_arch = "aarch64")]
 use std::sync::Arc;
 
@@ -602,4 +603,5 @@ pub trait Vcpu: Send + Sync {
     /// Trigger NMI interrupt
     ///
     fn nmi(&self) -> Result<()>;
+    unsafe fn get_kvm_vcpu_raw_fd(&self) -> RawFd;
 }

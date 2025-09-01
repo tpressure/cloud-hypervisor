@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::mem::size_of;
+use std::os::fd::RawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -54,6 +55,7 @@ use hypervisor::HypervisorType;
 #[cfg(feature = "guest_debug")]
 use hypervisor::StandardRegisters;
 use hypervisor::{CpuState, HypervisorCpuError, VmExit, VmOps};
+use kvm_bindings::kvm_run;
 use libc::{c_void, siginfo_t};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use linux_loader::elf::Elf64_Nhdr;
@@ -89,6 +91,12 @@ use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::vm::physical_bits;
 use crate::vm_config::CpusConfig;
 use crate::{GuestMemoryMmap, CPU_MANAGER_SNAPSHOT_ID};
+
+struct SafeWrapper<T>(T);
+unsafe impl<T> Send for SafeWrapper<T> {}
+unsafe impl<T> Sync for SafeWrapper<T> {}
+
+static STATIC_VCPUS: Mutex<Vec<(u8 /* ID*/, SafeWrapper<*mut kvm_run>)>> = Mutex::new(vec![]);
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
@@ -486,6 +494,10 @@ impl Vcpu {
             .set_gic_redistributor_addr(gicr_base)
             .map_err(Error::VcpuSetGicrBaseAddr)?;
         Ok(())
+    }
+
+    pub fn get_kvm_vcpu_raw_fd(&self) -> RawFd {
+        unsafe { self.vcpu.get_kvm_vcpu_raw_fd() }
     }
 }
 
@@ -982,6 +994,28 @@ impl CpuManager {
         vcpu_thread_barrier: Arc<Barrier>,
         inserting: bool,
     ) -> Result<()> {
+        {
+            let raw_kvm_fd = vcpu.lock().unwrap().get_kvm_vcpu_raw_fd();
+
+            let buffer = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    4096,
+                    libc::PROT_WRITE | libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    raw_kvm_fd,
+                    0,
+                )
+            };
+            assert_ne!(buffer, libc::MAP_FAILED);
+
+            let mut vcpus = STATIC_VCPUS.lock().unwrap();
+            vcpus.push((
+                vcpu.lock().unwrap().id,
+                SafeWrapper(buffer.cast::<kvm_run>()),
+            ));
+        }
+
         let reset_evt = self.reset_evt.try_clone().unwrap();
         let exit_evt = self.exit_evt.try_clone().unwrap();
         #[cfg(feature = "kvm")]
@@ -1060,7 +1094,29 @@ impl CpuManager {
                             return;
                         }
                     }
-                    extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {}
+                    extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {
+                        let thread = self::thread::current();
+                        let name = thread.name().unwrap();
+                        let prefix = "vcpu";
+                        let id = &name[prefix.len()..];
+                        let vcpu_id = id.parse::<u8>().unwrap();
+                        let vcpus = STATIC_VCPUS.lock().unwrap();
+                        for (vcpu_id_, kvm_run) in &*vcpus {
+                            let kvm_run = kvm_run.0;
+                            if  *vcpu_id_ == vcpu_id {
+                                /*let kvm_run = unsafe {  kvm_run.as_mut() }.unwrap();
+                                kvm_run.immediate_exit = std::hint::black_box(1);*/
+
+                                // Write the second field: immediate exit
+                                let ptr_kvm_run_immediate_exit = unsafe { kvm_run.cast::<u8>().add(1) };
+                                unsafe {
+                                    core::ptr::write_volatile(ptr_kvm_run_immediate_exit, 1);
+                                }
+                            }
+                        }
+                        // TODO ::Release?
+                        std::sync::atomic::fence(Ordering::SeqCst);
+                    }
                     // This uses an async signal safe handler to kill the vcpu handles.
                     register_signal_handler(SIGRTMIN(), handle_signal)
                         .expect("Failed to register vcpu signal handler");
