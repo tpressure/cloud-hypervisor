@@ -1177,7 +1177,7 @@ impl CpuManager {
                                 vcpu_paused.store(true, Ordering::SeqCst);
                                 while vcpu_pause_signalled.load(Ordering::SeqCst) {
                                     if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
-                                        info!("going to park thread");
+                                        info!("going to park thread {}", vcpu_id);
                                     }
                                     thread::park();
                                 }
@@ -2385,7 +2385,10 @@ impl Pausable for CpuManager {
 
         self.signal_vcpus();
 
-        for vcpu in self.vcpus.iter() {
+        for (vcpu_id, vcpu) in self.vcpus.iter().enumerate() {
+            if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+                info!("pausing thread {}", vcpu_id);
+            }
             let mut vcpu = vcpu.lock().unwrap();
             vcpu.pause()?;
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -2422,7 +2425,10 @@ impl Pausable for CpuManager {
         assert_eq!(self.current_state_transition, None);
         self.current_state_transition = Some(StateTransition::Resuming);
 
-        for vcpu in self.vcpus.iter() {
+        for (vcpu_id, vcpu) in self.vcpus.iter().enumerate() {
+            if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+                info!("resuming thread {}", vcpu_id);
+            }
             vcpu.lock().unwrap().resume()?;
         }
 
