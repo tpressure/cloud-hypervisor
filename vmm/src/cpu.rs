@@ -1134,6 +1134,9 @@ impl CpuManager {
 
                     std::panic::catch_unwind(move || {
                         loop {
+                            if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+                                info!("entering run loop on cpu {}", vcpu_id);
+                            }
                             // If we are being told to pause, we park the thread
                             // until the pause boolean is toggled.
                             // The resume operation is responsible for toggling
@@ -1177,7 +1180,7 @@ impl CpuManager {
                                 vcpu_paused.store(true, Ordering::SeqCst);
                                 while vcpu_pause_signalled.load(Ordering::SeqCst) {
                                     if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
-                                        info!("going to park thread {}", vcpu_id);
+                                        info!("going to park thread {} vcpu_paused:{}", vcpu_id, vcpu_paused.load(Ordering::SeqCst));
                                     }
                                     thread::park();
                                 }
