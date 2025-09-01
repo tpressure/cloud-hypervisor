@@ -2404,20 +2404,23 @@ impl Pausable for CpuManager {
         // their run vCPU loop.
         self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
 
+        for vcpu in self.vcpus.iter() {
+            vcpu.lock().unwrap().resume()?;
+        }
         // Unpark all the vCPU threads.
         // Step 1/2: signal each thread
         {
-            for state in self.vcpu_states.iter() {
+            for state in self.vcpu_states.iter().rev() {
                 state.unpark_thread();
             }
         }
         // Step 2/2: wait for state ACK
         {
-            for state in self.vcpu_states.iter() {
+            for state in self.vcpu_states.iter().rev() {
                 // wait for vCPU to update state
                 while state.paused.load(Ordering::SeqCst) {
                     // To avoid a priority inversion with the vCPU thread
-                    thread::sleep(std::time::Duration::from_millis(1));
+                    thread::sleep(std::time::Duration::from_micros(1));
                 }
             }
         }
