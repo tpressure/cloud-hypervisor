@@ -2401,11 +2401,15 @@ impl Pausable for CpuManager {
 
         // The vCPU thread will change its paused state before parking, wait here for each
         // activated vCPU change their state to ensure they have parked.
-        for state in self.vcpu_states.iter() {
+        for (idx, state) in self.vcpu_states.iter().enumerate() {
             if state.active() {
                 while !state.paused.load(Ordering::SeqCst) {
                     // To avoid a priority inversion with the vCPU thread
                     thread::sleep(std::time::Duration::from_millis(1));
+                    if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+                        info!("waiting for vcpu {}", idx);
+                        thread::sleep(std::time::Duration::from_millis(1000));
+                    }
                 }
             }
         }
