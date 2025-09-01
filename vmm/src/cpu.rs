@@ -1208,12 +1208,12 @@ impl CpuManager {
                             let mut vcpu = vcpu.lock().unwrap();
                             #[cfg(not(feature = "tdx"))]
                             if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
-                                info!("going to lock vcpu");
+                                info!("going to lock vcpu {}", vcpu_id);
                             }
                             let vcpu = vcpu.lock().unwrap();
                             // vcpu.run() returns false on a triple-fault so trigger a reset
                             if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
-                                info!("going to run vcpu");
+                                info!("going to run vcpu {}", vcpu_id);
                             }
                             match vcpu.run() {
                                 Ok(run) => match run {
