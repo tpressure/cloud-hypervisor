@@ -2373,9 +2373,15 @@ impl Aml for CpuManager {
 
 impl Pausable for CpuManager {
     fn pause(&mut self) -> std::result::Result<(), MigratableError> {
+<<<<<<< HEAD
         assert_eq!(self.current_state_transition, None);
         self.current_state_transition = Some(StateTransition::Pausing);
 
+=======
+        if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("pause begin");
+        }
+>>>>>>> 3398d83da (xxx)
         // Tell the vCPUs to pause themselves next time they exit
         let old = self.vcpus_pause_signalled.swap(true, Ordering::SeqCst);
         if old {
@@ -2384,6 +2390,9 @@ impl Pausable for CpuManager {
             // also just performed a .pause(). We don't use strong
             // synchronization between these threads in all cases, as every
             // ms counts for the migration thread to reach a low downtime.
+            if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+                info!("pause early end");
+            }
             return Ok(());
         }
 
@@ -2420,6 +2429,9 @@ impl Pausable for CpuManager {
                 }
             }
         }
+        if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("pause end");
+        }
 
         self.current_state_transition = None;
         Ok(())
@@ -2428,6 +2440,10 @@ impl Pausable for CpuManager {
     fn resume(&mut self) -> std::result::Result<(), MigratableError> {
         assert_eq!(self.current_state_transition, None);
         self.current_state_transition = Some(StateTransition::Resuming);
+
+        if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("resume begin");
+        }
 
         for (vcpu_id, vcpu) in self.vcpus.iter().enumerate() {
             if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
@@ -2450,8 +2466,14 @@ impl Pausable for CpuManager {
             }
             state.unpark_thread();
         }
+<<<<<<< HEAD
 
         self.current_state_transition = None;
+=======
+        if THROTTLE_99.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("resume end");
+        }
+>>>>>>> 3398d83da (xxx)
         Ok(())
     }
 }
