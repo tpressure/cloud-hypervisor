@@ -17,6 +17,8 @@ const AUTO_CONVERGE_ITERATION_INCREASE: u64 = 1;
 /// Maximum vCPU throttling value.
 const AUTO_CONVERGE_MAX: u8 = 99;
 
+use std::sync::AtomicBool;
+
 static THROTTLE_99: AtomicBool = AtomicBool::new(false);
 
 use std::collections::HashMap;
