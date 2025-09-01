@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 use vm_migration::Pausable;
 
 use crate::cpu::CpuManager;
+use crate::THROTTLE_99;
 
 /// The possible command of the thread, i.e., the current state.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
