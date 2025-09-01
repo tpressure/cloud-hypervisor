@@ -9,11 +9,11 @@ extern crate event_monitor;
 extern crate log;
 
 /// Amount of iterations before auto-converging starts.
-const AUTO_CONVERGE_ITERATION_DELAY: u64 = 2;
+const AUTO_CONVERGE_ITERATION_DELAY: u64 = 1;
 /// Step size in percent to increase the vCPU throttling.
-const AUTO_CONVERGE_STEP_SIZE: u8 = 10;
+const AUTO_CONVERGE_STEP_SIZE: u8 = 50;
 /// Amount of iterations after that we increase vCPU throttling.
-const AUTO_CONVERGE_ITERATION_INCREASE: u64 = 2;
+const AUTO_CONVERGE_ITERATION_INCREASE: u64 = 1;
 /// Maximum vCPU throttling value.
 const AUTO_CONVERGE_MAX: u8 = 99;
 
