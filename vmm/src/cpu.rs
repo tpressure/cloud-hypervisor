@@ -643,6 +643,7 @@ struct VcpuState {
     handle: Option<thread::JoinHandle<()>>,
     kill: Arc<AtomicBool>,
     vcpu_run_interrupted: Arc<AtomicBool>,
+    /// Used to ACK state changes from the run vCPU loop to the CPU Manager.
     paused: Arc<AtomicBool>,
 }
 
@@ -1168,13 +1169,11 @@ impl CpuManager {
 
                                 vcpu_run_interrupted.store(true, Ordering::SeqCst);
 
-                                //let resume_lock = RESUME_LOCK.read().unwrap();
                                 vcpu_paused.store(true, Ordering::SeqCst);
                                 while vcpu_pause_signalled.load(Ordering::SeqCst) {
                                     thread::park();
                                 }
                                 vcpu_paused.store(false, Ordering::SeqCst);
-                                //drop(resume_lock);
                                 vcpu_run_interrupted.store(false, Ordering::SeqCst);
                             }
 
@@ -2421,7 +2420,6 @@ impl Pausable for CpuManager {
                 }
             }
         }
-
         Ok(())
     }
 }
