@@ -5,7 +5,6 @@
 
 use std::io::{Read, Write};
 
-use log::info;
 use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
 
@@ -216,17 +215,10 @@ impl Response {
 }
 
 #[repr(C)]
-#[derive(Clone, Default, Debug, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
 pub struct MemoryRange {
     pub gpa: u64,
     pub length: u64,
-}
-
-impl MemoryRange {
-    /// End address (exclusive).
-    pub fn end(&self) -> u64 {
-        self.gpa + self.length
-    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -316,96 +308,8 @@ impl MemoryRangeTable {
         for table in tables {
             data.extend(table.data);
         }
+        data.sort();
+        data.dedup();
         Self { data }
-    }
-
-    /// Merge memory map ranges to reduce memory load that needs to be
-    /// transferred.
-    pub fn merge_memory_ranges(&mut self) {
-        let old_len = self.data.len();
-        if self.data.len() <= 1 {
-            return;
-        }
-
-        // Remove zero-length ranges
-        self.data.retain(|r| r.length > 0);
-
-        // Sort by gpa (start address)
-        self.data.sort_unstable_by_key(|r| r.gpa);
-
-        let mut merged: Vec<MemoryRange> = Vec::new();
-        merged.push(self.data[0].clone());
-
-        for range in &self.data[1..] {
-            // unwrap: we know we have at least one element in `merged`.
-            let last = merged.last_mut().unwrap();
-            if range.gpa <= last.end() {
-                // Overlaps or touches -> extend last
-                let new_end = last.end().max(range.end());
-                last.length = new_end - last.gpa;
-            } else {
-                // Disjoint -> push new
-                merged.push(range.clone());
-            }
-        }
-
-        self.data = merged;
-        if self.data.len() != old_len {
-            info!(
-                "merging memory range table: old len={old_len}, new len={}",
-                self.data.len()
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_merge_memory_ranges() {
-        let ranges = vec![
-            MemoryRange {
-                gpa: 0x1000,
-                length: 0x2000,
-            }, // [0x1000, 0x3000)
-            MemoryRange {
-                gpa: 0x2000,
-                length: 0x2000,
-            }, // [0x2000, 0x4000) overlaps
-            MemoryRange {
-                gpa: 0x5000,
-                length: 0x1000,
-            }, // [0x5000, 0x6000) separate
-            MemoryRange {
-                gpa: 0x0,
-                length: 0x0800,
-            }, // [0x0000, 0x0800) disjoint
-            MemoryRange {
-                gpa: 0x6000,
-                length: 0x0000,
-            }, // zero-length -> ignored
-        ];
-
-        let mut memory_map = MemoryRangeTable { data: ranges };
-        memory_map.merge_memory_ranges();
-
-        let expected = vec![
-            MemoryRange {
-                gpa: 0x0000,
-                length: 0x0800,
-            }, // [0x0000, 0x0800)
-            MemoryRange {
-                gpa: 0x1000,
-                length: 0x3000,
-            }, // [0x1000, 0x4000)
-            MemoryRange {
-                gpa: 0x5000,
-                length: 0x1000,
-            }, // [0x5000, 0x6000)
-        ];
-
-        assert_eq!(memory_map.data, expected);
     }
 }
