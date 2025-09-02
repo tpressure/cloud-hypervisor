@@ -80,20 +80,24 @@ impl ThrottleWorker {
     const THREAD_NAME: &'static str = "throttle-vcpu";
 
     /// Executes the provided callback and goes to sleep until the specified
-    /// `target_duration` passed.
+    /// `sleep_duration` passed.
+    ///
+    /// The time to execute the callback itself is not taken into account
+    /// when sleeping for `sleep_duration`. Therefore, the callback is
+    /// supposed to be quick (a couple of milliseconds).
     ///
     /// The thread is interruptible during the sleep phase when the `receiver`
     /// receives a new [`ThrottleCommand`].
     ///
     /// # Arguments
     /// - `callback`: Function to run
-    /// - `target_duration`: Duration this function takes at most, including
+    /// - `sleep_duration`: Duration this function takes at most, including
     ///   running the `callback`.
     /// - `receiver`: Receiving end of the channel to the migration managing
     ///   thread.
     fn execute_and_wait_interruptible(
         callback: &impl Fn(),
-        target_duration: Duration,
+        sleep_duration: Duration,
         receiver: &mpsc::Receiver<ThrottleCommand>,
         is_pause: bool,
     ) -> Option<ThrottleCommand> {
@@ -101,16 +105,13 @@ impl ThrottleWorker {
         callback();
         let cb_duration = begin.elapsed();
 
-        let action = if is_pause { "pausing" } else { "resuming" };
-        if cb_duration.as_millis() > Self::TIMESLICE_MS as u128 {
+        let action = if is_pause { "pause" } else { "resume" };
+        if cb_duration.as_millis() > 30 {
             warn!(
-                "timeslice ({} ms) should be no longer than {action} all vCPUs! took {} ms",
-                Self::TIMESLICE_MS,
+                "CpuManager::{action} took suspiciously long: {} ms",
                 cb_duration.as_millis(),
             );
         }
-
-        let sleep_duration = target_duration.saturating_sub(cb_duration);
 
         // It might happen that sometimes we get interrupted during a sleep phase
         // with a new higher throttle percentage but this is negligible. For an
