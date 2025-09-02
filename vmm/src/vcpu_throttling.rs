@@ -286,19 +286,9 @@ impl ThrottleWorker {
                 return cmd;
             }
 
-            let old_timeslice = timeslice_ctx.current_timeslice;
-
             // Update timeslice for next cycle. This way, we can closely match the expected
             // percentage for pause() and resume().
             timeslice_ctx.update_timeslice();
-
-            let new_timeslice = timeslice_ctx.current_timeslice;
-
-            info!(
-                "timeslice updated: {} ms => {} ms",
-                old_timeslice.as_millis(),
-                new_timeslice.as_millis()
-            );
         }
     }
 
