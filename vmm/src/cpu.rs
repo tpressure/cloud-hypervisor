@@ -1099,6 +1099,9 @@ impl CpuManager {
                     }
                     extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {
                         if IS_IN_SHUTDOWN.load(Ordering::SeqCst) {
+                            let mut lock = STATIC_VCPUS.write().unwrap();
+                            // release all
+                            lock.drain(..);
                             return;
                         }
 
