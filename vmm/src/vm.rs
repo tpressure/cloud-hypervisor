@@ -2928,10 +2928,18 @@ impl Migratable for Vm {
     }
 
     fn dirty_log(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
-        Ok(MemoryRangeTable::new_from_tables(vec![
+        let mut table = MemoryRangeTable::new_from_tables(vec![
             self.memory_manager.lock().unwrap().dirty_log()?,
             self.device_manager.lock().unwrap().dirty_log()?,
-        ]))
+        ]);
+        // Optimize load we have to transfer.
+        let begin = Instant::now();
+        table.merge_memory_ranges();
+        info!(
+            "merge memory ranges took { } ms",
+            begin.elapsed().as_millis()
+        );
+        Ok(table)
     }
 
     fn start_migration(&mut self) -> std::result::Result<(), MigratableError> {

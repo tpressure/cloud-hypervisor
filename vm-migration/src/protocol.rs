@@ -4,7 +4,7 @@
 //
 
 use std::io::{Read, Write};
-use std::time::Instant;
+
 use log::info;
 use serde::{Deserialize, Serialize};
 use vm_memory::ByteValued;
@@ -311,31 +311,18 @@ impl MemoryRangeTable {
         self.data.extend(table.data)
     }
 
-    /// Adds the entries and afterward merges all memory ranges.
     pub fn new_from_tables(tables: Vec<Self>) -> Self {
         let mut data = Vec::new();
         for table in tables {
             data.extend(table.data);
         }
-        let mut this = Self { data };
-
-        // Optimize load we have to transfer.
-        let begin = Instant::now();
-        this.merge_memory_ranges();
-        info!(
-            "merge memory ranges took { } ms",
-            begin.elapsed().as_millis()
-        );
-
-        this
+        Self { data }
     }
 
     /// Merge memory map ranges to reduce memory load that needs to be
     /// transferred.
-    fn merge_memory_ranges(&mut self) {
+    pub fn merge_memory_ranges(&mut self) {
         let old_len = self.data.len();
-
-        info!("merge memory range: len={}", self.data.len());
         if self.data.len() <= 1 {
             return;
         }
@@ -365,7 +352,7 @@ impl MemoryRangeTable {
         self.data = merged;
         if self.data.len() != old_len {
             info!(
-                "merged memory range table entries: old len={old_len}, new len={}",
+                "merging memory range table: old len={old_len}, new len={}",
                 self.data.len()
             );
         }
