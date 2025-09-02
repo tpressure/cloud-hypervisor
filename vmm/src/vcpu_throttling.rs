@@ -99,19 +99,8 @@ impl ThrottleWorker {
         callback: &impl Fn(),
         sleep_duration: Duration,
         receiver: &mpsc::Receiver<ThrottleCommand>,
-        is_pause: bool,
     ) -> Option<ThrottleCommand> {
-        let begin = Instant::now();
         callback();
-        let cb_duration = begin.elapsed();
-
-        let action = if is_pause { "pause" } else { "resume" };
-        if cb_duration.as_millis() > 30 {
-            warn!(
-                "CpuManager::{action} took suspiciously long: {} ms",
-                cb_duration.as_millis(),
-            );
-        }
 
         // It might happen that sometimes we get interrupted during a sleep phase
         // with a new higher throttle percentage but this is negligible. For an
@@ -162,13 +151,11 @@ impl ThrottleWorker {
         receiver: &mpsc::Receiver<ThrottleCommand>,
         current_throttle: &mut u64,
         pre_break: impl FnOnce(),
-        is_pause: bool,
     ) -> Option<ThrottleCommand>
     where
         F: Fn(),
     {
-        let maybe_task =
-            Self::execute_and_wait_interruptible(callback, duration, receiver, is_pause);
+        let maybe_task = Self::execute_and_wait_interruptible(callback, duration, receiver);
         match maybe_task {
             None => None,
             Some(ThrottleCommand::Throttling(next)) => {
@@ -206,8 +193,7 @@ impl ThrottleWorker {
             let wait_ms_after_pause = Self::TIMESLICE_MS * current_throttle / 100;
             let wait_ms_after_resume = Self::TIMESLICE_MS - wait_ms_after_pause;
 
-            // pause vCPUs
-            let begin = Instant::now();
+            // pause vCPUs;
             if let Some(cmd) = Self::throttle_step(
                 callback_pause_vcpus,
                 Duration::from_millis(wait_ms_after_pause),
@@ -218,16 +204,11 @@ impl ThrottleWorker {
                 // performs .pause() right after anyway. We could make .pause() and
                 // .resume() idempotent.
                 callback_resume_vcpus,
-                true,
             ) {
                 // We only exit here in case if ThrottleCommand::Waiting or ::Exiting
                 return cmd;
             }
-            if current_throttle == 99 {
-                info!("pausing took {} ms", begin.elapsed().as_millis());
-            }
 
-            let begin = Instant::now();
             // resume vCPUs
             if let Some(cmd) = Self::throttle_step(
                 callback_resume_vcpus,
@@ -235,13 +216,9 @@ impl ThrottleWorker {
                 receiver,
                 &mut current_throttle,
                 || {},
-                false,
             ) {
                 // We only exit here in case if ThrottleCommand::Waiting or ::Exiting
                 return cmd;
-            }
-            if current_throttle == 99 {
-                info!("resume  took {} ms", begin.elapsed().as_millis());
             }
         }
     }
