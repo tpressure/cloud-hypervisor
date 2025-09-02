@@ -1172,7 +1172,9 @@ impl Vmm {
                 let new_throttle = current_throttle + AUTO_CONVERGE_STEP_SIZE;
                 let new_throttle = std::cmp::min(new_throttle, AUTO_CONVERGE_MAX);
                 log::info!("Increasing auto-converge: {new_throttle}%");
-                vm.set_throttle_percent(new_throttle);
+                if new_throttle != current_throttle {
+                    vm.set_throttle_percent(new_throttle);
+                }
             }
 
             // Update the start time of the iteration
