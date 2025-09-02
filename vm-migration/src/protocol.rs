@@ -215,7 +215,7 @@ impl Response {
 }
 
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, PartialOrd, Eq, Ord, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRange {
     pub gpa: u64,
     pub length: u64,
@@ -308,7 +308,6 @@ impl MemoryRangeTable {
         for table in tables {
             data.extend(table.data);
         }
-        data.sort();
         data.dedup();
         Self { data }
     }
