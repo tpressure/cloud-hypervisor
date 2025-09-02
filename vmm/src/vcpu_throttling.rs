@@ -52,6 +52,47 @@ enum ThrottleCommand {
     Exiting,
 }
 
+/// Helper to adapt the throttling timeslice as we go, depending on the time it
+/// takes to pause() and resume() all vCPUs.
+#[derive(Debug)]
+struct TimesliceContext {
+    current_timeslice: Duration,
+    previous_pause_cb_duration: Duration,
+    previous_resume_cb_duration: Duration,
+}
+
+impl TimesliceContext {
+    /// Creates a new instance with [`ThrottleWorker::INITIAL_TIMESLICE`].
+    fn new() -> Self {
+        Self {
+            current_timeslice: ThrottleWorker::INITIAL_TIMESLICE,
+            previous_pause_cb_duration: Duration::ZERO,
+            previous_resume_cb_duration: Duration::ZERO,
+        }
+    }
+
+    /// Updates the timeslice.
+    fn update_timeslice(&mut self,
+                        previous_pause_cb_duration: Duration,
+                        previous_resume_cb_duration: Duration) {
+        // CpuManager::pause() plus CpuManager::resume() without additional delay is the shortest
+        // we can get.
+        let one_percent = previous_pause_cb_duration + previous_resume_cb_duration;
+        self.current_timeslice = one_percent * 100;
+    }
+
+    fn calc_sleep_durations(&self, percentage: u64) -> (Duration /* after pause */, Duration /* after resume */) {
+        assert!(percentage <= 100);
+        assert!(percentage > 0);
+
+        let timeslice_ms = self.current_timeslice.as_millis() as u64;
+        let wait_ms_after_pause_ms = timeslice_ms * percentage / 100;
+        let wait_ms_after_resume_ms = timeslice_ms - wait_ms_after_pause_ms;
+
+        (Duration::from_millis(wait_ms_after_pause_ms), Duration::from_millis(wait_ms_after_resume_ms))
+    }
+}
+
 /// Context of the vCPU throttle thread.
 // The main justification for this dedicated type is to split the thread
 // functions from the higher-level control API.
@@ -61,19 +102,8 @@ pub struct ThrottleWorker {
 }
 
 impl ThrottleWorker {
-    /// The timeslice for a throttling cycle (vCPU pause & resume).
-    ///
-    /// We use a small slice here to guarantee quicker response times
-    /// within the guest.
-    ///
-    /// | Throttle | Pause duration | Run duration    |
-    /// |----------|----------------|-----------------|
-    /// |      1 % |           1 ms |           99 ms |
-    /// |     10 % |          10 ms |           90 ms |
-    /// |     50 % |          50 ms |           50 ms |
-    /// |     90 % |          90 ms |           10 ms |
-    /// |     99 % |          99 ms |            1 ms |
-    const TIMESLICE_MS: u64 = 100;
+    /// The initial timeslice for a throttling cycle (vCPU pause & resume).
+    const INITIAL_TIMESLICE: Duration    = Duration::from_millis(100);
 
     /// This should not be named "vcpu*" as libvirt fails when
     /// iterating the vCPU threads then. Fix this first in libvirt!
@@ -97,6 +127,7 @@ impl ThrottleWorker {
     ///   thread.
     fn execute_and_wait_interruptible(
         callback: &impl Fn(),
+        callback_duration: &mut Duration,
         sleep_duration: Duration,
         receiver: &mpsc::Receiver<ThrottleCommand>,
         is_pause: bool,
@@ -139,8 +170,7 @@ impl ThrottleWorker {
     ///
     /// # Arguments
     /// - `callback`: Function to run (e.g., pause or resume vCPUs).
-    /// - `duration`: Maximum time this step may block, including running
-    ///   the `callback`.
+    /// - `sleep_duration`: Time to sleep after
     /// - `receiver`: Channel for receiving new [`ThrottleCommand`]s.
     /// - `current_throttle`: Mutable reference to the current throttle
     ///   percentage (updated on [`ThrottleCommand::Throttling`]).
@@ -153,6 +183,7 @@ impl ThrottleWorker {
     ///   throttling should stop.
     fn throttle_step<F>(
         callback: &F,
+        sleep_duration: &mut Duration,
         duration: Duration,
         receiver: &mpsc::Receiver<ThrottleCommand>,
         current_throttle: &mut u64,
@@ -163,7 +194,7 @@ impl ThrottleWorker {
         F: Fn(),
     {
         let maybe_task =
-            Self::execute_and_wait_interruptible(callback, duration, receiver, is_pause);
+            Self::execute_and_wait_interruptible(callback, sleep_duration, duration, receiver, is_pause);
         match maybe_task {
             None => None,
             Some(ThrottleCommand::Throttling(next)) => {
@@ -192,19 +223,20 @@ impl ThrottleWorker {
     ) -> ThrottleCommand {
         // The current throttle value, as long as the thread is throttling.
         let mut current_throttle = initial_throttle as u64;
+        let timeslice_ctx = TimesliceContext::new();
 
         loop {
             // Catch logic bug: We should have exited in this case already.
             assert_ne!(current_throttle, 0);
             assert!(current_throttle < 100);
 
-            let wait_ms_after_pause = Self::TIMESLICE_MS * current_throttle / 100;
-            let wait_ms_after_resume = Self::TIMESLICE_MS - wait_ms_after_pause;
+            let (wait_ms_after_pause, wait_ms_after_resume) = timeslice_ctx.calc_sleep_durations(current_throttle);
 
             // pause vCPUs
             if let Some(cmd) = Self::throttle_step(
                 callback_pause_vcpus,
-                Duration::from_millis(wait_ms_after_pause),
+                &mut timeslice_ctx.previous_pause_cb_duration,
+                wait_ms_after_pause,
                 receiver,
                 &mut current_throttle,
                 // TODO: future optimization
@@ -221,7 +253,8 @@ impl ThrottleWorker {
             // resume vCPUs
             if let Some(cmd) = Self::throttle_step(
                 callback_resume_vcpus,
-                Duration::from_millis(wait_ms_after_resume),
+                &mut timeslice_ctx.previous_resume_cb_duration,
+                wait_ms_after_resume,
                 receiver,
                 &mut current_throttle,
                 || {},
@@ -230,6 +263,7 @@ impl ThrottleWorker {
                 // We only exit here in case if ThrottleCommand::Waiting or ::Exiting
                 return cmd;
             }
+
         }
     }
 
@@ -492,16 +526,16 @@ mod tests {
                 let mut handler =
                     ThrottleThreadHandle::new(callback_pause_vcpus, callback_resume_vcpus);
                 handler.set_throttle_percent(5);
-                sleep(Duration::from_millis(ThrottleWorker::TIMESLICE_MS));
+                sleep(Duration::from_millis(ThrottleWorker::INITIAL_TIMESLICE));
                 handler.set_throttle_percent(10);
-                sleep(Duration::from_millis(ThrottleWorker::TIMESLICE_MS));
+                sleep(Duration::from_millis(ThrottleWorker::INITIAL_TIMESLICE));
 
                 // Assume we aborted vCPU throttling (or the live-migration at all).
                 handler.set_throttle_percent(0 /* reset to waiting */);
                 handler.set_throttle_percent(5);
-                sleep(Duration::from_millis(ThrottleWorker::TIMESLICE_MS));
+                sleep(Duration::from_millis(ThrottleWorker::INITIAL_TIMESLICE));
                 handler.set_throttle_percent(10);
-                sleep(Duration::from_millis(ThrottleWorker::TIMESLICE_MS));
+                sleep(Duration::from_millis(ThrottleWorker::INITIAL_TIMESLICE));
 
                 // The test is successful if we don't have a panic here due to a
                 // closed channel.
