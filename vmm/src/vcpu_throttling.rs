@@ -106,7 +106,10 @@ impl ThrottleWorker {
         let cb_duration = begin.elapsed();
 
         let action = if is_pause { "pause" } else { "resume" };
-        info!("CpuManager::{action}() took: {} ms", cb_duration.as_millis(),);
+        info!(
+            "CpuManager::{action}() took: {} ms",
+            cb_duration.as_millis(),
+        );
 
         // It might happen that sometimes we get interrupted during a sleep phase
         // with a new higher throttle percentage but this is negligible. For an
@@ -135,7 +138,7 @@ impl ThrottleWorker {
     ///   throttle percentage in `current_throttle` and continues with the
     ///   loop. Returns `None`.
     /// - If a [`ThrottleCommand::Waiting`] or [`ThrottleCommand::Exiting`]
-    ///   arrives, invokes the `pre_break` closure and returns that command.
+    ///   arrives, this command is forwarded to the caller.
     ///
     /// # Arguments
     /// - `callback`: Function to run (e.g., pause or resume vCPUs).
@@ -144,8 +147,6 @@ impl ThrottleWorker {
     /// - `receiver`: Channel for receiving new [`ThrottleCommand`]s.
     /// - `current_throttle`: Mutable reference to the current throttle
     ///   percentage (updated on [`ThrottleCommand::Throttling`]).
-    /// - `pre_break`: Closure to run just before breaking out of the loop,
-    ///   typically to clean up state (e.g., ensure vCPUs are resumed).
     ///
     /// # Returns
     /// - `None` if the throttling cycle should continue.
@@ -156,7 +157,6 @@ impl ThrottleWorker {
         duration: Duration,
         receiver: &mpsc::Receiver<ThrottleCommand>,
         current_throttle: &mut u64,
-        pre_break: impl FnOnce(),
         is_pause: bool,
     ) -> Option<ThrottleCommand>
     where
@@ -173,10 +173,7 @@ impl ThrottleWorker {
                 *current_throttle = next as u64;
                 None
             }
-            Some(cmd @ (ThrottleCommand::Exiting | ThrottleCommand::Waiting)) => {
-                pre_break();
-                Some(cmd)
-            }
+            Some(cmd @ (ThrottleCommand::Exiting | ThrottleCommand::Waiting)) => Some(cmd),
         }
     }
 
@@ -207,13 +204,13 @@ impl ThrottleWorker {
                 Duration::from_millis(wait_ms_after_pause),
                 receiver,
                 &mut current_throttle,
+                true,
+            ) {
                 // TODO: future optimization
                 // Prevent unnecessary resume() here when the migration thread
                 // performs .pause() right after anyway. We could make .pause() and
                 // .resume() idempotent.
-                callback_resume_vcpus,
-                true,
-            ) {
+                callback_resume_vcpus();
                 // We only exit here in case if ThrottleCommand::Waiting or ::Exiting
                 return cmd;
             }
@@ -224,7 +221,6 @@ impl ThrottleWorker {
                 Duration::from_millis(wait_ms_after_resume),
                 receiver,
                 &mut current_throttle,
-                || {},
                 false,
             ) {
                 // We only exit here in case if ThrottleCommand::Waiting or ::Exiting
