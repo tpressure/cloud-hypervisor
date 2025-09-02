@@ -111,10 +111,10 @@ impl TimesliceContext {
         let wait_ms_after_pause_ms = timeslice_ms * percentage / 100;
         let wait_ms_after_resume_ms = timeslice_ms - wait_ms_after_pause_ms;
 
-        let wait_ms_after_pause_ms =
-            wait_ms_after_pause_ms - self.previous_pause_cb_duration.as_millis() as u64;
-        let wait_ms_after_resume_ms =
-            wait_ms_after_resume_ms - self.previous_resume_cb_duration.as_millis() as u64;
+        let wait_ms_after_pause_ms = wait_ms_after_pause_ms
+            .saturating_sub(self.previous_pause_cb_duration.as_millis() as u64);
+        let wait_ms_after_resume_ms = wait_ms_after_resume_ms
+            .saturating_sub(self.previous_resume_cb_duration.as_millis() as u64);
 
         (
             Duration::from_millis(wait_ms_after_pause_ms),
