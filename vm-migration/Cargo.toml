@@ -10,3 +10,4 @@ serde = { version = "1.0.208", features = ["derive", "rc"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 vm-memory = { workspace = true, features = ["backend-atomic", "backend-mmap"] }
+log = "0.4.27"
