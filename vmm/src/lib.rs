@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
 use std::time::{Duration, Instant};
 use std::{io, result, thread};
-
+use std::sync::atomic::Ordering;
 use anyhow::anyhow;
 #[cfg(feature = "dbus_api")]
 use api::dbus::{DBusApiOptions, DBusApiShutdownChannels};
@@ -63,6 +63,7 @@ use crate::api::{
 use crate::config::{add_to_config, RestoreConfig};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
+use crate::cpu::IS_IN_SHUTDOWN;
 use crate::landlock::Landlock;
 use crate::memory_manager::MemoryManager;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -1423,6 +1424,10 @@ impl Vmm {
         // The VM is already stopped.
         vm.release_disk_locks()
             .map_err(|e| MigratableError::UnlockError(anyhow!("{e}")))?;
+
+        // Prevent signal handler to access thread local storage when signals are received
+        // close to the end when thread-local storage is already destroyed.
+        IS_IN_SHUTDOWN.store(true, Ordering::SeqCst);
 
         // Capture snapshot and send it
         let vm_snapshot = vm.snapshot()?;

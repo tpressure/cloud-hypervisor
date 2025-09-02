@@ -97,6 +97,8 @@ unsafe impl<T> Send for SafeWrapper<T> {}
 unsafe impl<T> Sync for SafeWrapper<T> {}
 
 static STATIC_VCPUS: RwLock<Vec<(u8 /* ID*/, SafeWrapper<*mut kvm_run>)>> = RwLock::new(vec![]);
+/// Better alternative would be to prevent signals.
+pub static IS_IN_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
@@ -1096,6 +1098,12 @@ impl CpuManager {
                         }
                     }
                     extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {
+                        if IS_IN_SHUTDOWN.load(Ordering::SeqCst) {
+                            return;
+                        }
+
+                        // thread::current() panics in shutdown phase, when threadlocal data was
+                        // already destroyed.
                         let thread = self::thread::current();
                         let name = thread.name().unwrap();
                         let prefix = "vcpu";
