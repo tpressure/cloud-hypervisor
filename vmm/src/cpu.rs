@@ -19,7 +19,7 @@ use std::mem::size_of;
 use std::os::fd::RawFd;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, RwLock};
 use std::{cmp, io, result, thread};
 
 #[cfg(not(target_arch = "riscv64"))]
@@ -96,7 +96,7 @@ struct SafeWrapper<T>(T);
 unsafe impl<T> Send for SafeWrapper<T> {}
 unsafe impl<T> Sync for SafeWrapper<T> {}
 
-static STATIC_VCPUS: Mutex<Vec<(u8 /* ID*/, SafeWrapper<*mut kvm_run>)>> = Mutex::new(vec![]);
+static STATIC_VCPUS: RwLock<Vec<(u8 /* ID*/, SafeWrapper<*mut kvm_run>)>> = RwLock::new(vec![]);
 
 #[cfg(all(target_arch = "aarch64", feature = "guest_debug"))]
 /// Extract the specified bits of a 64-bit integer.
@@ -1010,7 +1010,7 @@ impl CpuManager {
             };
             assert_ne!(buffer, libc::MAP_FAILED);
 
-            let mut vcpus = STATIC_VCPUS.lock().unwrap();
+            let mut vcpus = STATIC_VCPUS.write().unwrap();
             vcpus.push((
                 vcpu.lock().unwrap().id,
                 SafeWrapper(buffer.cast::<kvm_run>()),
@@ -1101,7 +1101,7 @@ impl CpuManager {
                         let prefix = "vcpu";
                         let id = &name[prefix.len()..];
                         let vcpu_id = id.parse::<u8>().unwrap();
-                        let vcpus = STATIC_VCPUS.lock().unwrap();
+                        let vcpus = STATIC_VCPUS.read().unwrap();
                         for (vcpu_id_, kvm_run) in &*vcpus {
                             let kvm_run = kvm_run.0;
                             if  *vcpu_id_ == vcpu_id {
