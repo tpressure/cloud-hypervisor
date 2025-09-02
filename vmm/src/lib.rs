@@ -1205,13 +1205,12 @@ impl Vmm {
                 .map(|range| range.length)
                 .sum();
 
-            if vm.throttle_percent() == AUTO_CONVERGE_MAX {
-                info!(
-                    "throttle=99%, pending= {} MiB, throughput: {} MB/s",
-                    s.pending_size / 1024 / 1024,
-                    s.mb_per_sec
-                );
-            }
+            info!(
+                "throttle={}%, pending= {} MiB, throughput: {} MB/s",
+                vm.throttle_percent(),
+                s.pending_size / 1024 / 1024,
+                s.mb_per_sec
+            );
 
             // Update thresholds
             if bandwidth > 0.0 {
