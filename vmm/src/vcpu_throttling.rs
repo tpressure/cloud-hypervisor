@@ -66,7 +66,12 @@ impl TimesliceContext {
     /// The initial timeslice for a throttling cycle (vCPU pause & resume).
     const INITIAL_TIMESLICE: Duration = Duration::from_millis(100);
 
-    const MAX_TIMESLICE: Duration = Duration::from_millis(1500);
+    /// Maximum time slice. This should not be too big.
+    ///
+    /// Otherwise, for example: Assuming we have 10% throttling and
+    /// 2000ms time slice, then the WM will be unresponsive for
+    /// 200ms every 1800ms. This is not convenient.    ///
+    const MAX_TIMESLICE: Duration = Duration::from_millis(800);
 
     /// Creates a new instance with [`Self::INITIAL_TIMESLICE`].
     fn new() -> Self {
