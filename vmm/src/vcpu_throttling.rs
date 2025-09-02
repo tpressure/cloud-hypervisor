@@ -158,19 +158,12 @@ impl ThrottleWorker {
         callback_duration: &mut Duration,
         sleep_duration: Duration,
         receiver: &mpsc::Receiver<ThrottleCommand>,
-        is_pause: bool,
     ) -> Option<ThrottleCommand> {
         let begin = Instant::now();
         callback();
         let cb_duration = begin.elapsed();
         // Help to adjust the timeslice in the next cycle.
         *callback_duration = cb_duration;
-
-        let action = if is_pause { "pause" } else { "resume" };
-        info!(
-            "CpuManager::{action}() took: {} ms",
-            cb_duration.as_millis(),
-        );
 
         // It might happen that sometimes we get interrupted during a sleep phase
         // with a new higher throttle percentage but this is negligible. For an
@@ -218,18 +211,12 @@ impl ThrottleWorker {
         duration: Duration,
         receiver: &mpsc::Receiver<ThrottleCommand>,
         current_throttle: &mut u64,
-        is_pause: bool,
     ) -> Option<ThrottleCommand>
     where
         F: Fn(),
     {
-        let maybe_task = Self::execute_and_wait_interruptible(
-            callback,
-            sleep_duration,
-            duration,
-            receiver,
-            is_pause,
-        );
+        let maybe_task =
+            Self::execute_and_wait_interruptible(callback, sleep_duration, duration, receiver);
         match maybe_task {
             None => None,
             Some(ThrottleCommand::Throttling(next)) => {
@@ -272,7 +259,6 @@ impl ThrottleWorker {
                 wait_ms_after_pause,
                 receiver,
                 &mut current_throttle,
-                true,
             ) {
                 // TODO: future optimization
                 // Prevent unnecessary resume() here when the migration thread
@@ -290,15 +276,24 @@ impl ThrottleWorker {
                 wait_ms_after_resume,
                 receiver,
                 &mut current_throttle,
-                false,
             ) {
                 // We only exit here in case if ThrottleCommand::Waiting or ::Exiting
                 return cmd;
             }
 
+            let old_timeslice = timeslice_ctx.current_timeslice;
+
             // Update timeslice for next cycle. This way, we can closely match the expected
             // percentage for pause() and resume().
             timeslice_ctx.update_timeslice();
+
+            let new_timeslice = timeslice_ctx.current_timeslice;
+
+            info!(
+                "timeslice updated: {} ms => {} ms",
+                old_timeslice.as_millis(),
+                new_timeslice.as_millis()
+            );
         }
     }
 
