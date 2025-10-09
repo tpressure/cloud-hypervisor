@@ -863,7 +863,21 @@ impl Block {
         println!("in block::resize");
         match self.disk_image.set_len(new_size) {
             Ok(_) => {
-                Ok(())
+                println!("disk_nsectors: old:{} new:{}", self.disk_nsectors, new_size / 512);
+                self.disk_nsectors = new_size / 512;
+                self.config.capacity = new_size / 512;
+                self.state().disk_nsectors = new_size / 512;
+                println!("self.disk_nsectors: {}", self.disk_nsectors);
+
+                if let Some(interrupt_cb) = self.common.interrupt_cb.as_ref() {
+                    interrupt_cb
+                        .trigger(VirtioInterruptType::Config)
+                        .map_err(|e| {
+                                Error::IoError(format!("Failed to signal the guest about resize: {:?}", e))
+                                })
+                } else {
+                    Ok(())
+                }
             }
             Err(e) => Err(Error::IoError(format!("disk_image.set_len failed: {:?}", e),
             ))
