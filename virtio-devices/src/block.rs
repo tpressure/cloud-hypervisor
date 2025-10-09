@@ -863,11 +863,16 @@ impl Block {
         println!("in block::resize");
         match self.disk_image.set_len(new_size) {
             Ok(_) => {
+                let _ = self.common.pause();
+
                 println!("disk_nsectors: old:{} new:{}", self.disk_nsectors, new_size / 512);
                 self.disk_nsectors = new_size / 512;
                 self.config.capacity = new_size / 512;
                 self.state().disk_nsectors = new_size / 512;
                 println!("self.disk_nsectors: {}", self.disk_nsectors);
+
+                let _ = self.common.resume();
+
 
                 if let Some(interrupt_cb) = self.common.interrupt_cb.as_ref() {
                     interrupt_cb
