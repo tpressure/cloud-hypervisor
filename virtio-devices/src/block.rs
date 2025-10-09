@@ -93,6 +93,8 @@ pub enum Error {
         /// The path of the disk image.
         path: PathBuf,
     },
+    #[error("Io error")]
+    IoError(String),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -853,6 +855,19 @@ impl Block {
             }
         );
         self.writeback.store(writeback, Ordering::Release);
+    }
+
+    pub fn resize(&mut self, new_size: u64) -> Result<()> {
+        //XXX: check size multiple of sector size
+
+        println!("in block::resize");
+        match self.disk_image.set_len(new_size) {
+            Ok(_) => {
+                Ok(())
+            }
+            Err(e) => Err(Error::IoError(format!("disk_image.set_len failed: {:?}", e),
+            ))
+        }
     }
 
     #[cfg(fuzzing)]

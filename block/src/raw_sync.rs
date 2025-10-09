@@ -47,6 +47,10 @@ impl DiskFile for RawFileDiskSync {
     fn fd(&mut self) -> BorrowedDiskFd<'_> {
         BorrowedDiskFd::new(self.file.as_raw_fd())
     }
+
+    fn set_len(&mut self, _size: u64) -> DiskFileResult<()> {
+        Err(DiskFileError::Unsupported)
+    }
 }
 
 pub struct RawFileSync {

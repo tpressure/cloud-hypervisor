@@ -1762,13 +1762,11 @@ impl Vm {
     }
 
     pub fn resize_disk(&mut self, id: String, desired_size: u64) -> Result<()> {
-        let disk_config = &mut self.config.lock().unwrap().disks;
-        if let Some(disks) = disk_config {
-            for disk in disks {
-                //  println!("{:?}", disk);
-                println!("{:?}", disk.id);
-            }
-        }
+        self.device_manager
+            .lock()
+            .unwrap()
+            .resize_disk(&id, desired_size)
+            .map_err(Error::DeviceManager)?;
         return Ok(());
     }
 
