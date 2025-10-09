@@ -1761,6 +1761,17 @@ impl Vm {
         Ok(())
     }
 
+    pub fn resize_disk(&mut self, id: String, desired_size: u64) -> Result<()> {
+        let disk_config = &mut self.config.lock().unwrap().disks;
+        if let Some(disks) = disk_config {
+            for disk in disks {
+                //  println!("{:?}", disk);
+                println!("{:?}", disk.id);
+            }
+        }
+        return Ok(());
+    }
+
     pub fn resize_zone(&mut self, id: String, desired_memory: u64) -> Result<()> {
         let memory_config = &mut self.config.lock().unwrap().memory;
 
