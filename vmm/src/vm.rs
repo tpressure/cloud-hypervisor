@@ -1761,6 +1761,15 @@ impl Vm {
         Ok(())
     }
 
+    pub fn resize_disk(&mut self, id: String, desired_size: u64) -> Result<()> {
+        self.device_manager
+            .lock()
+            .unwrap()
+            .resize_disk(&id, desired_size)
+            .map_err(Error::DeviceManager)?;
+        return Ok(());
+    }
+
     pub fn resize_zone(&mut self, id: String, desired_memory: u64) -> Result<()> {
         let memory_config = &mut self.config.lock().unwrap().memory;
 
