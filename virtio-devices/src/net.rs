@@ -472,8 +472,8 @@ impl Net {
             // Configure TSO/UFO features when hardware checksum offload is enabled.
             if offload_csum {
                 avail_features |= (1 << VIRTIO_NET_F_CSUM)
-                    | (1 << VIRTIO_NET_F_GUEST_CSUM)
-                    | (1 << VIRTIO_NET_F_CTRL_GUEST_OFFLOADS);
+                    | (1 << VIRTIO_NET_F_GUEST_CSUM);
+                    //  | (1 << VIRTIO_NET_F_CTRL_GUEST_OFFLOADS);
 
                 if offload_tso {
                     avail_features |= (1 << VIRTIO_NET_F_HOST_ECN)
