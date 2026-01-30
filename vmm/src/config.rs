@@ -685,7 +685,7 @@ impl CpusConfig {
             boot_vcpus,
             max_vcpus,
             topology,
-            kvm_hyperv,
+            kvm_hyperv: true,
             max_phys_bits,
             affinity,
             features,

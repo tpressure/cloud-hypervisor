@@ -2877,7 +2877,7 @@ impl Snapshottable for Vm {
             let guard = self.config.lock().unwrap();
             let amx = guard.cpus.features.amx;
             let phys_bits = physical_bits(self.hypervisor.as_ref(), guard.cpus.max_phys_bits);
-            let kvm_hyperv = guard.cpus.kvm_hyperv;
+            let kvm_hyperv = true;
             let profile = guard.cpus.profile;
             // Drop the guard before function call
             core::mem::drop(guard);

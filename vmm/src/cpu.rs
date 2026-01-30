@@ -485,7 +485,7 @@ impl Vcpu {
             self.id,
             boot_setup,
             cpuid,
-            kvm_hyperv,
+            true,
             self.vendor,
             topology,
             nested,
@@ -881,7 +881,7 @@ impl CpuManager {
                 hypervisor,
                 &arch::CpuidConfig {
                     phys_bits,
-                    kvm_hyperv: self.config.kvm_hyperv,
+                    kvm_hyperv: true,
                     #[cfg(feature = "tdx")]
                     tdx,
                     amx: self.config.features.amx,
@@ -984,7 +984,7 @@ impl CpuManager {
         vcpu.configure(
             boot_setup,
             self.cpuid.clone(),
-            self.config.kvm_hyperv,
+            true,
             topology,
             self.config.nested,
         )?;

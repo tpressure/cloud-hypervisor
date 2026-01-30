@@ -2370,7 +2370,7 @@ impl Vmm {
                 let amx = guard.cpus.features.amx;
                 let max_phys_bits = guard.cpus.max_phys_bits;
                 let profile = guard.cpus.profile;
-                let kvm_hyperv = guard.cpus.kvm_hyperv;
+                let kvm_hyperv = true;
                 // Drop lock before function call
                 core::mem::drop(guard);
                 let phys_bits = vm::physical_bits(hypervisor, max_phys_bits);
@@ -2381,7 +2381,7 @@ impl Vmm {
                 hypervisor,
                 &arch::CpuidConfig {
                     phys_bits,
-                    kvm_hyperv,
+                    kvm_hyperv: true,
                     #[cfg(feature = "tdx")]
                     tdx: false,
                     amx,
@@ -2525,7 +2525,7 @@ impl Vmm {
                 self.hypervisor.as_ref(),
                 &arch::CpuidConfig {
                     phys_bits,
-                    kvm_hyperv: vm_config.cpus.kvm_hyperv,
+                    kvm_hyperv: true,
                     #[cfg(feature = "tdx")]
                     tdx: false,
                     amx: vm_config.cpus.features.amx,
