@@ -1032,9 +1032,9 @@ pub fn configure_vcpu(
     vcpu.set_cpuid2(&cpuid)
         .map_err(|e| Error::SetSupportedCpusFailed(e.into()))?;
 
-    if kvm_hyperv {
+    //  if kvm_hyperv {
         vcpu.enable_hyperv_synic().unwrap();
-    }
+    //  }
 
     regs::setup_msrs(vcpu).map_err(Error::MsrsConfiguration)?;
     if let Some((kernel_entry_point, guest_memory)) = boot_setup {

@@ -623,7 +623,7 @@ impl CpusConfig {
         let kvm_hyperv = parser
             .convert::<Toggle>("kvm_hyperv")
             .map_err(Error::ParseCpus)?
-            .unwrap_or(Toggle(false))
+            .unwrap_or(Toggle(true))
             .0;
         let max_phys_bits = parser
             .convert::<u8>("max_phys_bits")

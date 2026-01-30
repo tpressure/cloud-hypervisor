@@ -584,7 +584,7 @@ impl vm::Vm for KvmVm {
             msrs: self.msrs.clone(),
             vm_ops,
             #[cfg(target_arch = "x86_64")]
-            hyperv_synic: AtomicBool::new(false),
+            hyperv_synic: AtomicBool::new(true),
             #[cfg(target_arch = "x86_64")]
             xsave_size,
         };
