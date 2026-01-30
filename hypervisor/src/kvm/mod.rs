@@ -2608,9 +2608,9 @@ impl cpu::Vcpu for KvmVcpu {
             self.set_tsc_khz(freq)?;
         }
 
-        if state.hyperv_synic {
-            self.enable_hyperv_synic()?;
-        }
+        //  if state.hyperv_synic {
+        self.enable_hyperv_synic()?;
+        //  }
 
         // Try to set all MSRs previously stored.
         // If the number of MSRs set from SET_MSRS is different from the
