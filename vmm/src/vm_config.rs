@@ -84,7 +84,7 @@ impl Default for CpusConfig {
             boot_vcpus: DEFAULT_VCPUS,
             max_vcpus: DEFAULT_VCPUS,
             topology: None,
-            kvm_hyperv: false,
+            kvm_hyperv: true,
             max_phys_bits: DEFAULT_MAX_PHYS_BITS,
             affinity: None,
             features: CpuFeatures::default(),
