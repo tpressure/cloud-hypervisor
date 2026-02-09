@@ -749,18 +749,15 @@ impl DeviceRelocation for AddressManager {
 
                 // Find the specific allocator that this BAR was allocated from and use it for new one
                 for allocator in allocators {
-                    let allocator_base = allocator.lock().unwrap().base();
-                    let allocator_end = allocator.lock().unwrap().end();
+                    let mut allocator_unlocked = allocator.lock().unwrap();
+                    let allocator_base = allocator_unlocked.base();
+                    let allocator_end = allocator_unlocked.end();
 
                     if old_base >= allocator_base.0 && old_base <= allocator_end.0 {
-                        allocator
-                            .lock()
-                            .unwrap()
+                        allocator_unlocked
                             .free(GuestAddress(old_base), len as GuestUsize);
 
-                        allocator
-                            .lock()
-                            .unwrap()
+                        allocator_unlocked
                             .allocate(Some(GuestAddress(new_base)), len as GuestUsize, Some(len))
                             .ok_or_else(|| io::Error::other("failed allocating new MMIO range"))?;
 
