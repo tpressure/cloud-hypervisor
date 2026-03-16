@@ -15,7 +15,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::{ffi, result, thread};
+use std::{ffi, result, thread, time::Duration};
 
 use acpi_tables::{Aml, aml};
 use anyhow::{Context, anyhow};
@@ -1451,6 +1451,7 @@ impl MemoryManager {
 
         // Prefault the region if needed, in parallel.
         if prefault {
+            info!("prefaulting");
             let page_size =
                 Self::get_prefault_align_size(backing_file, hugepages, hugepage_size)? as usize;
 
@@ -1466,6 +1467,7 @@ impl MemoryManager {
             let remainder = num_pages % num_threads;
 
             let barrier = Arc::new(Barrier::new(num_threads));
+            info!("before scope");
             thread::scope(|s| {
                 let r = &region;
                 let mut handles = Vec::new();
@@ -1505,6 +1507,8 @@ impl MemoryManager {
                             Error::PrefaultMemory(io::Error::other("Prefault thread died"))
                         })?
                         .map_err(Error::PrefaultMemory)?;
+                        info!("sleeping");
+                        std::thread::sleep(std::time::Duration::from_secs(60));
                 }
 
                 Ok(())
