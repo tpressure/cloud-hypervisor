@@ -2701,10 +2701,13 @@ impl DeviceManager {
                 )
                 .map_err(DeviceManagerError::Disk)?;
 
-            let detected_image_type =
-                detect_image_type(&mut file).map_err(DeviceManagerError::DetectImageType)?;
+            //  let detected_image_type =
+                //  detect_image_type(&mut file).map_err(DeviceManagerError::DetectImageType)?;
+            let detected_image_type = ImageType::Qcow2;
+
             let mut disable_sector0_writes = false;
 
+            disk_cfg.image_type = ImageType::Raw;
             if disk_cfg.image_type == ImageType::Unknown {
                 warn!(
                     "No image_type specified - detected as {detected_image_type}. \
