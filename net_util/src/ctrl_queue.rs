@@ -2,19 +2,22 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::sync::{Arc, Mutex};
+
 use log::{error, info, warn};
 use thiserror::Error;
 use virtio_bindings::virtio_net::{
-    VIRTIO_NET_CTRL_GUEST_OFFLOADS, VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET, VIRTIO_NET_CTRL_MQ,
-    VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MAX, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN,
-    VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, VIRTIO_NET_ERR, VIRTIO_NET_OK,
+    VIRTIO_NET_CTRL_ANNOUNCE, VIRTIO_NET_CTRL_ANNOUNCE_ACK, VIRTIO_NET_CTRL_GUEST_OFFLOADS,
+    VIRTIO_NET_CTRL_GUEST_OFFLOADS_SET, VIRTIO_NET_CTRL_MQ, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MAX,
+    VIRTIO_NET_CTRL_MQ_VQ_PAIRS_MIN, VIRTIO_NET_CTRL_MQ_VQ_PAIRS_SET, VIRTIO_NET_ERR,
+    VIRTIO_NET_OK, VIRTIO_NET_S_ANNOUNCE,
 };
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{ByteValued, Bytes, GuestMemoryError};
 use vm_virtio::{AccessPlatform, Translatable};
 
 use super::virtio_features_to_tap_offload;
-use crate::{GuestMemoryMmap, Tap};
+use crate::{GuestMemoryMmap, Tap, VirtioNetConfig};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -55,11 +58,21 @@ unsafe impl ByteValued for ControlHeader {}
 
 pub struct CtrlQueue {
     pub taps: Vec<Tap>,
+    pub config: Option<Arc<Mutex<VirtioNetConfig>>>,
+    pub supports_announce: bool,
 }
 
 impl CtrlQueue {
-    pub fn new(taps: Vec<Tap>) -> Self {
-        CtrlQueue { taps }
+    pub fn new(
+        taps: Vec<Tap>,
+        config: Option<Arc<Mutex<VirtioNetConfig>>>,
+        supports_announce: bool,
+    ) -> Self {
+        CtrlQueue {
+            taps,
+            config,
+            supports_announce,
+        }
     }
 
     pub fn process(
@@ -125,6 +138,22 @@ impl CtrlQueue {
                         ok
                     } else {
                         warn!("Unsupported command: {}", ctrl_hdr.cmd);
+                        false
+                    }
+                }
+                VIRTIO_NET_CTRL_ANNOUNCE => {
+                    if !self.supports_announce {
+                        warn!("Guest announce command received without negotiated support");
+                        false
+                    } else if u32::from(ctrl_hdr.cmd) != VIRTIO_NET_CTRL_ANNOUNCE_ACK {
+                        warn!("Unsupported command: {}", ctrl_hdr.cmd);
+                        false
+                    } else if let Some(config) = self.config.as_ref() {
+                        let mut config = config.lock().unwrap();
+                        config.status &= !(VIRTIO_NET_S_ANNOUNCE as u16);
+                        true
+                    } else {
+                        warn!("Guest announce command received without device config");
                         false
                     }
                 }

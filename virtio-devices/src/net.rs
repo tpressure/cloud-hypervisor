@@ -11,7 +11,7 @@ use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::{result, thread};
 
 use anyhow::anyhow;
@@ -410,7 +410,7 @@ pub struct Net {
     common: VirtioCommon,
     id: String,
     taps: Vec<Tap>,
-    config: VirtioNetConfig,
+    config: Arc<Mutex<VirtioNetConfig>>,
     ctrl_queue_epoll_thread: Option<thread::JoinHandle<()>>,
     counters: NetCounters,
     seccomp_action: SeccompAction,
@@ -493,7 +493,7 @@ impl Net {
                 }
             }
 
-            avail_features |= 1 << VIRTIO_NET_F_CTRL_VQ;
+            avail_features |= (1 << VIRTIO_NET_F_CTRL_VQ) | (1 << VIRTIO_NET_F_GUEST_ANNOUNCE);
             let queue_num = num_queues + 1;
 
             let mut config = VirtioNetConfig::default();
@@ -536,7 +536,7 @@ impl Net {
             },
             id,
             taps,
-            config,
+            config: Arc::new(Mutex::new(config)),
             ctrl_queue_epoll_thread: None,
             counters: NetCounters::default(),
             seccomp_action,
@@ -653,7 +653,7 @@ impl Net {
         NetState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            config: self.config,
+            config: *self.config.lock().unwrap(),
             queue_size: self.common.queue_sizes.clone(),
         }
     }
@@ -673,10 +673,11 @@ impl Net {
         const IPV4_ADDR_LENGTH: usize = 4; // Size of an IPv4 address
 
         let mut buf = [0u8; ETH_FRAME_LEN];
+        let config = self.config.lock().unwrap();
 
         // Ethernet header
         buf[0..6].copy_from_slice(&[0xff; MAC_ADDR_LEN]); // This is a broadcast
-        buf[6..12].copy_from_slice(&self.config.mac); // Src is this NIC
+        buf[6..12].copy_from_slice(&config.mac); // Src is this NIC
         buf[12..14].copy_from_slice(&ETH_P_RARP.to_be_bytes()); // This is a RARP packet
 
         // ARP Header
@@ -688,9 +689,9 @@ impl Net {
         // Thus the content of the next fields is largely irrelevant. Setting source
         // hardware address = target hardware address is fine according to RFC 903.
         buf[20..22].copy_from_slice(&ARP_OP_REQUEST_REV.to_be_bytes());
-        buf[22..28].copy_from_slice(&self.config.mac); // Source hardware address
+        buf[22..28].copy_from_slice(&config.mac); // Source hardware address
         buf[28..32].copy_from_slice(&[0x00; IPV4_ADDR_LENGTH]); // Source protocol address
-        buf[32..38].copy_from_slice(&self.config.mac); // Target hardware address
+        buf[32..38].copy_from_slice(&config.mac); // Target hardware address
         buf[38..42].copy_from_slice(&[0x00; IPV4_ADDR_LENGTH]); // Target protocol address
 
         buf
@@ -744,7 +745,7 @@ impl VirtioDevice for Net {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        self.read_config_from_slice(self.config.as_slice(), offset, data);
+        self.read_config_from_slice(self.config.lock().unwrap().as_slice(), offset, data);
     }
 
     fn activate(
@@ -782,7 +783,12 @@ impl VirtioDevice for Net {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: CtrlQueue::new(self.taps.clone()),
+                ctrl_q: CtrlQueue::new(
+                    self.taps.clone(),
+                    Some(self.config.clone()),
+                    self.common
+                        .feature_acked(VIRTIO_NET_F_GUEST_ANNOUNCE.into()),
+                ),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: self.common.access_platform.clone(),
@@ -922,9 +928,13 @@ impl VirtioDevice for Net {
     }
 
     fn post_migration_announcer(&self) -> Option<Box<dyn PostMigrationAnnouncer>> {
-        Some(Box::new(TapRarpAnnouncer::new(
+        Some(Box::new(TapPostMigrationAnnouncer::new(
             self.build_rarp_announce(),
             self.taps.clone(),
+            self.config.clone(),
+            self.common
+                .feature_acked(VIRTIO_NET_F_GUEST_ANNOUNCE.into()),
+            self.common.interrupt_cb.clone(),
         )))
     }
 }
@@ -959,18 +969,33 @@ impl Migratable for Net {}
 /// Sends RARP packets on a virtio-net device, to update the MAC to port
 /// mappings of switches in the network. This reduces the time until network
 /// packets reliably arrive at the network device.
-pub struct TapRarpAnnouncer {
+pub struct TapPostMigrationAnnouncer {
     announce: [u8; ETH_FRAME_LEN], // Buffer for the raw RARP packet.
     taps: Vec<Tap>,                // The TAP devices to the the packets on.
+    config: Arc<Mutex<VirtioNetConfig>>,
+    guest_announce: bool,
+    interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
 }
 
-impl TapRarpAnnouncer {
-    pub fn new(announce: [u8; 60], taps: Vec<Tap>) -> Self {
-        Self { announce, taps }
+impl TapPostMigrationAnnouncer {
+    pub fn new(
+        announce: [u8; 60],
+        taps: Vec<Tap>,
+        config: Arc<Mutex<VirtioNetConfig>>,
+        guest_announce: bool,
+        interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
+    ) -> Self {
+        Self {
+            announce,
+            taps,
+            config,
+            guest_announce,
+            interrupt_cb,
+        }
     }
 }
 
-impl PostMigrationAnnouncer for TapRarpAnnouncer {
+impl PostMigrationAnnouncer for TapPostMigrationAnnouncer {
     fn announce(&mut self) {
         // We have to add a virtio-net header to the announce.
         let mut buf = vec![0u8; vnet_hdr_len() + self.announce.len()];
@@ -986,6 +1011,16 @@ impl PostMigrationAnnouncer for TapRarpAnnouncer {
                     buf.len(),
                 )
             };
+        }
+
+        if self.guest_announce {
+            self.config.lock().unwrap().status |= VIRTIO_NET_S_ANNOUNCE as u16;
+
+            if let Some(interrupt_cb) = self.interrupt_cb.as_ref()
+                && let Err(e) = interrupt_cb.trigger(VirtioInterruptType::Config)
+            {
+                error!("Failed to signal guest announce config change: {e:?}");
+            }
         }
     }
 }

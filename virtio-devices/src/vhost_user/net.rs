@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
 use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler};
 use virtio_bindings::virtio_net::{
-    VIRTIO_NET_F_CSUM, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_GUEST_ECN,
-    VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6, VIRTIO_NET_F_GUEST_UFO,
-    VIRTIO_NET_F_HOST_ECN, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_HOST_TSO6, VIRTIO_NET_F_HOST_UFO,
-    VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU,
+    VIRTIO_NET_F_CSUM, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_GUEST_ANNOUNCE, VIRTIO_NET_F_GUEST_CSUM,
+    VIRTIO_NET_F_GUEST_ECN, VIRTIO_NET_F_GUEST_TSO4, VIRTIO_NET_F_GUEST_TSO6,
+    VIRTIO_NET_F_GUEST_UFO, VIRTIO_NET_F_HOST_ECN, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_HOST_TSO6,
+    VIRTIO_NET_F_HOST_UFO, VIRTIO_NET_F_MAC, VIRTIO_NET_F_MRG_RXBUF, VIRTIO_NET_F_MTU,
+    VIRTIO_NET_S_ANNOUNCE,
 };
 use virtio_bindings::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use virtio_queue::{Queue, QueueT};
@@ -25,13 +26,14 @@ use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::device::PostMigrationAnnouncer;
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::vhost_user::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
 use crate::vhost_user::{DEFAULT_VIRTIO_FEATURES, Error, Result, VhostUserCommon};
 use crate::{
     ActivateResult, GuestMemoryMmap, GuestRegionMmap, NetCtrlEpollHandler, VIRTIO_F_IOMMU_PLATFORM,
-    VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt,
+    VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt, VirtioInterruptType,
 };
 
 const DEFAULT_QUEUE_NUMBER: usize = 2;
@@ -52,7 +54,7 @@ pub struct Net {
     common: VirtioCommon,
     vu_common: VhostUserCommon,
     id: String,
-    config: VirtioNetConfig,
+    config: Arc<Mutex<VirtioNetConfig>>,
     guest_memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     ctrl_queue_epoll_thread: Option<thread::JoinHandle<()>>,
     epoll_thread: Option<thread::JoinHandle<()>>,
@@ -121,6 +123,7 @@ impl Net {
             // Filling device and vring features VMM supports.
             let mut avail_features = (1 << VIRTIO_NET_F_MRG_RXBUF)
                 | (1 << VIRTIO_NET_F_CTRL_VQ)
+                | (1 << VIRTIO_NET_F_GUEST_ANNOUNCE)
                 | DEFAULT_VIRTIO_FEATURES;
 
             if mtu.is_some() {
@@ -218,7 +221,7 @@ impl Net {
                 server,
                 ..Default::default()
             },
-            config,
+            config: Arc::new(Mutex::new(config)),
             guest_memory: None,
             ctrl_queue_epoll_thread: None,
             epoll_thread: None,
@@ -232,7 +235,7 @@ impl Net {
         State {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            config: self.config,
+            config: *self.config.lock().unwrap(),
             acked_protocol_features: self.vu_common.acked_protocol_features,
             vu_num_queues: self.vu_common.vu_num_queues,
         }
@@ -285,7 +288,7 @@ impl VirtioDevice for Net {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        self.read_config_from_slice(self.config.as_slice(), offset, data);
+        self.read_config_from_slice(self.config.lock().unwrap().as_slice(), offset, data);
     }
 
     fn activate(
@@ -311,7 +314,12 @@ impl VirtioDevice for Net {
                 mem: mem.clone(),
                 kill_evt,
                 pause_evt,
-                ctrl_q: CtrlQueue::new(Vec::new()),
+                ctrl_q: CtrlQueue::new(
+                    Vec::new(),
+                    Some(self.config.clone()),
+                    self.common
+                        .feature_acked(VIRTIO_NET_F_GUEST_ANNOUNCE.into()),
+                ),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
                 access_platform: None,
@@ -403,6 +411,16 @@ impl VirtioDevice for Net {
         self.vu_common.shutdown();
     }
 
+    fn post_migration_announcer(&self) -> Option<Box<dyn PostMigrationAnnouncer>> {
+        Some(Box::new(VhostUserNetAnnouncer {
+            config: self.config.clone(),
+            guest_announce: self
+                .common
+                .feature_acked(VIRTIO_NET_F_GUEST_ANNOUNCE.into()),
+            interrupt_cb: self.common.interrupt_cb.clone(),
+        }))
+    }
+
     fn add_memory_region(
         &mut self,
         region: &Arc<GuestRegionMmap>,
@@ -429,6 +447,28 @@ impl Pausable for Net {
         }
 
         self.vu_common.resume()
+    }
+}
+
+struct VhostUserNetAnnouncer {
+    config: Arc<Mutex<VirtioNetConfig>>,
+    guest_announce: bool,
+    interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
+}
+
+impl PostMigrationAnnouncer for VhostUserNetAnnouncer {
+    fn announce(&mut self) {
+        if !self.guest_announce {
+            return;
+        }
+
+        self.config.lock().unwrap().status |= VIRTIO_NET_S_ANNOUNCE as u16;
+
+        if let Some(interrupt_cb) = self.interrupt_cb.as_ref()
+            && let Err(e) = interrupt_cb.trigger(VirtioInterruptType::Config)
+        {
+            error!("Failed to signal guest announce config change: {e:?}");
+        }
     }
 }
 
