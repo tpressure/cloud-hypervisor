@@ -2054,6 +2054,17 @@ impl DeviceManager {
             .io_bus
             .insert(i8042, 0x61, 0x4)
             .map_err(DeviceManagerError::BusError)?;
+
+        // Add a minimal i8254 PIT for guests that still use the legacy timer
+        // during early boot CPU calibration.
+        let pit = Arc::new(Mutex::new(devices::legacy::Pit::new()));
+        self.bus_devices
+            .push(Arc::clone(&pit) as Arc<dyn BusDeviceSync>);
+        self.address_manager
+            .io_bus
+            .insert(pit, 0x40, 0x4)
+            .map_err(DeviceManagerError::BusError)?;
+
         {
             // Add a CMOS emulated device
             let mem_size = self

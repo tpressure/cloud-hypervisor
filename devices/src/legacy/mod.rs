@@ -15,6 +15,8 @@ mod fwdebug;
 #[cfg(target_arch = "aarch64")]
 mod gpio_pl061;
 mod i8042;
+#[cfg(target_arch = "x86_64")]
+mod pit;
 #[cfg(target_arch = "aarch64")]
 mod rtc_pl031;
 mod serial;
@@ -33,6 +35,8 @@ pub use self::gpio_pl061::Error as GpioDeviceError;
 #[cfg(target_arch = "aarch64")]
 pub use self::gpio_pl061::Gpio;
 pub use self::i8042::I8042Device;
+#[cfg(target_arch = "x86_64")]
+pub use self::pit::Pit;
 #[cfg(target_arch = "aarch64")]
 pub use self::rtc_pl031::Rtc;
 pub use self::serial::Serial;
