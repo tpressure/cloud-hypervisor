@@ -330,6 +330,38 @@ impl PtmSetBufferSize {
     }
 }
 
+/* GET_STATE_BLOB and SET_STATE_BLOB */
+#[derive(Debug)]
+pub struct PtmStateBlob {
+    pub member: MemberType,
+    pub result_code: PtmResult,
+    pub blob: Vec<u8>,
+}
+
+impl PtmStateBlob {
+    pub fn new() -> Self {
+        Self {
+            member: MemberType::Request,
+            result_code: 0,
+            blob: Vec::new(),
+        }
+    }
+
+    pub fn with_blob(blob: Vec<u8>) -> Self {
+        Self {
+            member: MemberType::Request,
+            result_code: 0,
+            blob,
+        }
+    }
+}
+
+impl Default for PtmStateBlob {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ptm for PtmSetBufferSize {
     fn ptm_to_request(&self) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::<u8>::new();
@@ -366,6 +398,59 @@ impl Ptm for PtmSetBufferSize {
 
     fn set_member_type(&mut self, mem: MemberType) {
         self.mem = mem;
+    }
+
+    fn set_result_code(&mut self, res: u32) {
+        self.result_code = res;
+    }
+
+    fn get_result_code(&self) -> u32 {
+        self.result_code
+    }
+}
+
+impl Ptm for PtmStateBlob {
+    fn ptm_to_request(&self) -> Vec<u8> {
+        // For SET_STATE_BLOB, we need to send the blob size (4 bytes) followed by the blob
+        let mut buf: Vec<u8> = Vec::new();
+        let blob_size = self.blob.len() as u32;
+        buf.extend_from_slice(&blob_size.to_be_bytes());
+        buf.extend_from_slice(&self.blob);
+        buf
+    }
+
+    fn get_member_type(&self) -> MemberType {
+        self.member
+    }
+
+    fn update_ptm_with_response(&mut self, buf: &[u8]) -> Result<()> {
+        // For GET_STATE_BLOB response: 4 bytes result code + 4 bytes blob size + blob data
+        if buf.len() < 8 {
+            return Err(Error::ConvertToPtm(anyhow!(
+                "Response for state blob cmd is too short. Got {} bytes",
+                buf.len()
+            )));
+        }
+
+        self.set_member_type(MemberType::Response);
+        self.set_result_code(u32::from_be_bytes(buf[0..4].try_into().unwrap()));
+
+        let blob_size = u32::from_be_bytes(buf[4..8].try_into().unwrap()) as usize;
+        if buf.len() < 8 + blob_size {
+            return Err(Error::ConvertToPtm(anyhow!(
+                "Response for state blob cmd truncated. Expected {} bytes, got {}",
+                8 + blob_size,
+                buf.len()
+            )));
+        }
+
+        self.blob = buf[8..8 + blob_size].to_vec();
+
+        Ok(())
+    }
+
+    fn set_member_type(&mut self, mem: MemberType) {
+        self.member = mem;
     }
 
     fn set_result_code(&mut self, res: u32) {

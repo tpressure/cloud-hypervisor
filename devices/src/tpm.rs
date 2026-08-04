@@ -13,10 +13,12 @@ use arch::aarch64::layout::{TPM_SIZE, TPM_START};
 #[cfg(target_arch = "x86_64")]
 use arch::x86_64::layout::{TPM_SIZE, TPM_START};
 use log::{debug, error, warn};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tpm::TPM_CRB_BUFFER_MAX;
 use tpm::emulator::{BackendCmd, Emulator};
 use vm_device::BusDevice;
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -219,7 +221,17 @@ fn locality_from_addr(addr: u32) -> u8 {
     (addr >> 12) as u8
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct TpmState {
+    pub regs: Vec<u32>,
+    pub backend_buff_size: usize,
+    pub data_buff: Vec<u8>,
+    pub data_buff_len: usize,
+    pub swtpm_state_blob: Vec<u8>,
+}
+
 pub struct Tpm {
+    id: String,
     emulator: Emulator,
     regs: [u32; TPM_CRB_R_MAX],
     backend_buff_size: usize,
@@ -228,17 +240,63 @@ pub struct Tpm {
 }
 
 impl Tpm {
-    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn new(
+        id: String,
+        path: impl AsRef<Path>,
+        state: Option<&TpmState>,
+    ) -> Result<Self> {
         let emulator = Emulator::new(path)
             .map_err(|e| Error::Init(anyhow!("Failed while initializing tpm Emulator: {e:?}")))?;
-        let mut tpm = Tpm {
-            emulator,
-            regs: [0; TPM_CRB_R_MAX],
-            backend_buff_size: TPM_CRB_BUFFER_MAX,
-            data_buff: [0; TPM_CRB_BUFFER_MAX],
-            data_buff_len: 0,
+
+        let (regs, backend_buff_size, data_buff, data_buff_len) = if let Some(state) = state {
+            // Convert Vec back to arrays
+            let mut regs = [0u32; TPM_CRB_R_MAX];
+            let mut data_buff = [0u8; TPM_CRB_BUFFER_MAX];
+
+            if state.regs.len() == TPM_CRB_R_MAX {
+                regs.copy_from_slice(&state.regs);
+            }
+
+            if state.data_buff.len() == TPM_CRB_BUFFER_MAX {
+                data_buff.copy_from_slice(&state.data_buff);
+            }
+
+            (
+                regs,
+                state.backend_buff_size,
+                data_buff,
+                state.data_buff_len,
+            )
+        } else {
+            (
+                [0; TPM_CRB_R_MAX],
+                TPM_CRB_BUFFER_MAX,
+                [0; TPM_CRB_BUFFER_MAX],
+                0,
+            )
         };
-        tpm.reset()?;
+
+        let mut tpm = Tpm {
+            id,
+            emulator,
+            regs,
+            backend_buff_size,
+            data_buff,
+            data_buff_len,
+        };
+
+        if let Some(state) = state {
+            // Restore swtpm state blob if available
+            if !state.swtpm_state_blob.is_empty() {
+                tpm.emulator
+                    .set_state_blob(&state.swtpm_state_blob)
+                    .map_err(|e| Error::Init(anyhow!("Failed to restore TPM state blob: {e:?}")))?;
+            }
+        } else {
+            // Initialize new TPM
+            tpm.reset()?;
+        }
+
         Ok(tpm)
     }
 
@@ -344,6 +402,16 @@ impl Tpm {
             )));
         }
         Ok(())
+    }
+
+    fn state(&self) -> TpmState {
+        TpmState {
+            regs: self.regs.to_vec(),
+            backend_buff_size: self.backend_buff_size,
+            data_buff: self.data_buff.to_vec(),
+            data_buff_len: self.data_buff_len,
+            swtpm_state_blob: Vec::new(), // Will be populated by snapshot()
+        }
     }
 }
 
@@ -538,6 +606,30 @@ impl BusDevice for Tpm {
         None
     }
 }
+
+impl Snapshottable for Tpm {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+        // Get the swtpm state blob
+        let swtpm_state_blob = self
+            .emulator
+            .get_state_blob()
+            .map_err(|e| MigratableError::Snapshot(anyhow!("Failed to get TPM state blob: {e:?}")))?;
+
+        // Create state with the swtpm blob
+        let mut state = self.state();
+        state.swtpm_state_blob = swtpm_state_blob;
+
+        Snapshot::new_from_state(&state)
+    }
+}
+
+impl Pausable for Tpm {}
+impl Transportable for Tpm {}
+impl Migratable for Tpm {}
 
 #[cfg(test)]
 mod unit_tests {

@@ -1536,7 +1536,7 @@ impl DeviceManager {
 
         #[cfg(not(target_arch = "riscv64"))]
         if let Some(tpm) = self.config.clone().lock().unwrap().tpm.as_ref() {
-            let tpm_dev = self.add_tpm_device(&tpm.socket)?;
+            let tpm_dev = self.add_tpm_device(&tpm.socket, snapshot)?;
             self.bus_devices
                 .push(Arc::clone(&tpm_dev) as Arc<dyn BusDeviceSync>);
         }
@@ -2597,12 +2597,17 @@ impl DeviceManager {
     fn add_tpm_device(
         &mut self,
         tpm_path: &Path,
+        snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<Arc<Mutex<devices::tpm::Tpm>>> {
+        // Extract TPM state from snapshot if available
+        let tpm_state = vm_migration::state_from_id(snapshot, "tpm")
+            .map_err(|e| DeviceManagerError::CreateTpmDevice(anyhow!("Failed to extract TPM state: {e:?}")))?;
+
         // Create TPM Device
-        let tpm = devices::tpm::Tpm::new(tpm_path).map_err(|e| {
-            DeviceManagerError::CreateTpmDevice(anyhow!("Failed to create TPM Device : {e:?}"))
-        })?;
-        let tpm = Arc::new(Mutex::new(tpm));
+        let tpm_dev = devices::tpm::Tpm::new("tpm".to_string(), tpm_path, tpm_state.as_ref()).map_err(
+            |e| DeviceManagerError::CreateTpmDevice(anyhow!("Failed to create TPM Device : {e:?}")),
+        )?;
+        let tpm = Arc::new(Mutex::new(tpm_dev));
 
         // Add TPM Device to mmio
         self.address_manager
@@ -2613,6 +2618,19 @@ impl DeviceManager {
                 arch::layout::TPM_SIZE,
             )
             .map_err(DeviceManagerError::BusError)?;
+
+        // Register TPM device in device tree for migration
+        let tpm_id = "tpm".to_string();
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(
+                tpm_id.clone(),
+                DeviceNode::new(
+                    tpm_id,
+                    Some(Arc::clone(&tpm) as Arc<Mutex<dyn vm_migration::Migratable>>),
+                ),
+            );
 
         Ok(tpm)
     }

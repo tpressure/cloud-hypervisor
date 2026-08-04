@@ -439,4 +439,90 @@ impl Emulator {
     pub fn get_buffer_size(&mut self) -> usize {
         self.set_buffer_size(0).unwrap_or(TPM_CRB_BUFFER_MAX)
     }
+
+    /// Get the TPM state blob from swtpm
+    /// This captures the internal TPM state including PCRs, keys, and sessions
+    pub fn get_state_blob(&mut self) -> Result<Vec<u8>> {
+        debug!("Getting TPM state blob");
+
+        // Send CmdGetStateBlob command (just the command number, no payload)
+        let cmd_no = (Commands::CmdGetStateBlob as u32).to_be_bytes();
+        self.control_socket.write(&cmd_no).map_err(|e| {
+            Error::RunControlCmd(anyhow!("Failed to send CmdGetStateBlob: {e:?}"))
+        })?;
+
+        // Read response: 4 bytes result code + 4 bytes blob size + blob data
+        // First read the header (8 bytes)
+        let mut header = [0u8; 8];
+        self.control_socket.read(&mut header).map_err(|e| {
+            Error::RunControlCmd(anyhow!("Failed to read CmdGetStateBlob header: {e:?}"))
+        })?;
+
+        let result_code = u32::from_be_bytes(header[0..4].try_into().unwrap());
+        if result_code != TPM_SUCCESS {
+            return Err(Error::RunControlCmd(anyhow!(
+                "CmdGetStateBlob returned error code: {result_code:?}"
+            )));
+        }
+
+        let blob_size = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+        debug!("TPM state blob size: {blob_size} bytes");
+
+        // Read the blob data
+        let mut blob = vec![0u8; blob_size];
+        self.control_socket.read(&mut blob).map_err(|e| {
+            Error::RunControlCmd(anyhow!("Failed to read CmdGetStateBlob data: {e:?}"))
+        })?;
+
+        debug!("Successfully retrieved TPM state blob");
+        Ok(blob)
+    }
+
+    /// Set the TPM state blob in swtpm
+    /// This restores the internal TPM state including PCRs, keys, and sessions
+    pub fn set_state_blob(&mut self, blob: &[u8]) -> Result<()> {
+        debug!("Setting TPM state blob (size: {} bytes)", blob.len());
+
+        // First stop the TPM before setting state
+        self.stop_tpm()?;
+
+        // Prepare request: command + blob size + blob data
+        let cmd_no = (Commands::CmdSetStateBlob as u32).to_be_bytes();
+        let blob_size = (blob.len() as u32).to_be_bytes();
+
+        let mut request = Vec::with_capacity(mem::size_of::<u32>() * 2 + blob.len());
+        request.extend_from_slice(&cmd_no);
+        request.extend_from_slice(&blob_size);
+        request.extend_from_slice(blob);
+
+        // Send the request
+        self.control_socket.write(&request).map_err(|e| {
+            Error::RunControlCmd(anyhow!("Failed to send CmdSetStateBlob: {e:?}"))
+        })?;
+
+        // Read response (just result code)
+        let mut response = [0u8; 4];
+        self.control_socket.read(&mut response).map_err(|e| {
+            Error::RunControlCmd(anyhow!("Failed to read CmdSetStateBlob response: {e:?}"))
+        })?;
+
+        let result_code = u32::from_be_bytes(response);
+        if result_code != TPM_SUCCESS {
+            return Err(Error::RunControlCmd(anyhow!(
+                "CmdSetStateBlob returned error code: {result_code:?}"
+            )));
+        }
+
+        // Restart the TPM after setting state
+        let mut init: PtmInit = PtmInit::new();
+        self.run_control_cmd(
+            Commands::CmdInit,
+            &mut init,
+            mem::size_of::<u32>(),
+            mem::size_of::<u32>(),
+        )?;
+
+        debug!("Successfully set TPM state blob");
+        Ok(())
+    }
 }
