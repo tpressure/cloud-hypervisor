@@ -1377,16 +1377,17 @@ impl PciDeviceCommonConfig {
 
 impl DiskConfig {
     pub const SYNTAX: &'static str = "Disk parameters \
-         \"path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=on|off,\
-         num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
-         vhost_user=on|off,socket=<vhost_user_socket_path>,\
-         bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
-         ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
-         id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
-         rate_limit_group=<group_id>,\
-         queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
-         serial=<serial_number>,backing_files=on|off,sparse=on|off,\
-         image_type=<raw,qcow2,vhd,vhdx>,lock_granularity=byte-range|full|qemu-compatible";
+          \"path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=on|off,\
+          num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
+          vhost_user=on|off,socket=<vhost_user_socket_path>,\
+          bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+          ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+          id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
+          rate_limit_group=<group_id>,\
+          queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
+          serial=<serial_number>,backing_files=on|off,sparse=on|off,\
+          image_type=<raw,qcow2,vhd,vhdx>,lock_granularity=byte-range|full|qemu-compatible,\
+          transport=<virtio,nvme>";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1413,6 +1414,7 @@ impl DiskConfig {
             .add("sparse")
             .add("image_type")
             .add("lock_granularity")
+            .add("transport")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
 
         parser.parse(disk).map_err(Error::ParseDisk)?;
@@ -1510,6 +1512,11 @@ impl DiskConfig {
             .map_err(Error::ParseDisk)?
             .unwrap_or_default();
 
+        let transport = parser
+            .convert::<DiskTransport>("transport")
+            .map_err(Error::ParseDisk)?
+            .unwrap_or_default();
+
         let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
             Some(TokenBucketConfig {
                 size: bw_size,
@@ -1563,6 +1570,7 @@ impl DiskConfig {
             sparse,
             image_type,
             lock_granularity,
+            transport,
         })
     }
 

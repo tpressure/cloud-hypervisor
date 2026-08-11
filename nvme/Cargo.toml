@@ -1,0 +1,31 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "nvme"
+rust-version.workspace = true
+version = "0.1.0"
+
+[features]
+default = []
+
+[dependencies]
+block = { path = "../block" }
+byteorder = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+pci = { path = "../pci" }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+vm-allocator = { path = "../vm-allocator" }
+vm-device = { path = "../vm-device" }
+vm-migration = { path = "../vm-migration" }
+vm-memory = { workspace = true, features = [
+  "backend-atomic",
+  "backend-bitmap",
+  "backend-mmap",
+] }
+vmm-sys-util = { workspace = true }
+
+[lints]
+workspace = true

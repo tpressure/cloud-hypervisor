@@ -85,6 +85,7 @@ use pci::{
     VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
 };
 use rate_limiter::group::RateLimiterGroup;
+use nvme::NvmeController;
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -129,7 +130,7 @@ use crate::serial_manager::{Error as SerialManagerError, SerialManager};
 use crate::vm_config::IvshmemConfig;
 use crate::vm_config::{
     ConsoleOutputMode, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig,
+    DeviceConfig, DiskConfig, DiskTransport, FsConfig, GenericVhostUserConfig, NetConfig,
     PciDeviceCommonConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig,
     VncListenerConfig, VsockConfig,
 };
@@ -332,6 +333,10 @@ pub enum DeviceManagerError {
     /// Cannot create virtio-watchdog device
     #[error("Cannot create virtio-watchdog device")]
     CreateVirtioWatchdog(#[source] io::Error),
+
+    /// Cannot create NVMe device
+    #[error("Cannot create NVMe device")]
+    Nvme(#[source] nvme::Error),
 
     /// Cannot create serial manager
     #[error("Cannot create serial manager")]
@@ -566,6 +571,10 @@ pub enum DeviceManagerError {
     /// No disk path was specified when one was expected
     #[error("No disk path was specified when one was expected")]
     NoDiskPath,
+
+    /// No disk ID was specified when one was expected
+    #[error("No disk ID was specified when one was expected")]
+    NoDiskId,
 
     /// Failed to update guest memory for virtio device.
     #[error("Failed to update guest memory for virtio device")]
@@ -1120,6 +1129,9 @@ pub struct DeviceManager {
     /// All disks. Needed for locking and unlocking the images.
     block_devices: Vec<Arc<Mutex<Block>>>,
 
+    /// NVMe controllers
+    nvme_devices: Vec<Arc<Mutex<NvmeController>>>,
+
     // List of bus devices
     // Let the DeviceManager keep strong references to the BusDevice devices.
     // This allows the IO and MMIO buses to be provided with Weak references,
@@ -1515,6 +1527,7 @@ impl DeviceManager {
             cpu_manager,
             virtio_devices: Vec::new(),
             block_devices: vec![],
+            nvme_devices: Vec::new(),
             bus_devices: Vec::new(),
             device_id_cnt,
             msi_interrupt_manager,
@@ -3265,6 +3278,70 @@ impl DeviceManager {
         })
     }
 
+    fn make_nvme_device(
+        &mut self,
+        disk_cfg: &mut DiskConfig,
+        snapshot: Option<&Snapshot>,
+    ) -> DeviceManagerResult<Arc<Mutex<NvmeController>>> {
+        let id = match disk_cfg.pci_common.id.as_ref() {
+            Some(id) => id.clone(),
+            None => disk_cfg
+                .pci_common
+                .id
+                .insert(self.next_device_name(DISK_DEVICE_NAME_PREFIX)?)
+                .clone(),
+        };
+
+        info!("Creating NVMe device: {disk_cfg:?}");
+
+        let disk_path = disk_cfg
+            .path
+            .as_ref()
+            .ok_or(DeviceManagerError::NoDiskPath)?
+            .clone();
+
+        let (_pci_segment_id, pci_device_bdf, resources) = self.pci_resources(
+            &id,
+            disk_cfg.pci_common.pci_segment,
+            disk_cfg.pci_common.pci_device_id,
+        )?;
+
+        let nvme_device = Arc::new(Mutex::new(NvmeController::new(
+            id.clone(),
+            disk_path,
+            disk_cfg.readonly,
+            self.msi_interrupt_manager.clone(),
+            self.memory_manager.lock().unwrap().guest_memory(),
+            pci_device_bdf.device(),
+        )
+        .map_err(DeviceManagerError::Nvme)?));
+
+        let nvme_device_clone = Arc::clone(&nvme_device);
+        let new_resources = self.add_pci_device(
+            nvme_device_clone,
+            nvme_device.clone(),
+            _pci_segment_id,
+            pci_device_bdf,
+            resources,
+        )?;
+
+        let _snapshot = snapshot;
+
+        let mut node = device_node!(id, nvme_device);
+        node.resources = new_resources;
+        node.pci_bdf = Some(pci_device_bdf);
+
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), node);
+
+        self.device_id_to_bdf
+            .insert(id.clone(), pci_device_bdf);
+
+        Ok(nvme_device)
+    }
+
     fn make_virtio_block_devices(
         &mut self,
         snapshot: Option<&Snapshot>,
@@ -3272,8 +3349,13 @@ impl DeviceManager {
         let mut block_devices = self.config.lock().unwrap().disks.take();
         if let Some(disk_list_cfg) = &mut block_devices {
             for disk_cfg in disk_list_cfg.iter_mut() {
-                let device = self.make_virtio_block_device(disk_cfg, false, snapshot)?;
-                self.virtio_devices.push(device);
+                if disk_cfg.transport == DiskTransport::Nvme {
+                    let device = self.make_nvme_device(disk_cfg, snapshot)?;
+                    self.nvme_devices.push(device);
+                } else {
+                    let device = self.make_virtio_block_device(disk_cfg, false, snapshot)?;
+                    self.virtio_devices.push(device);
+                }
             }
         }
         self.config.lock().unwrap().disks = block_devices;
@@ -5502,8 +5584,17 @@ impl DeviceManager {
             return Err(DeviceManagerError::InvalidIommuHotplug);
         }
 
-        let device = self.make_virtio_block_device(disk_cfg, true, None)?;
-        self.hotplug_virtio_pci_device(device)
+        if disk_cfg.transport == DiskTransport::Nvme {
+            let id = disk_cfg.pci_common.id.clone().unwrap();
+            let nvme_device = self.make_nvme_device(disk_cfg, None)?;
+            self.nvme_devices.push(nvme_device);
+
+            let bdf = self.device_id_to_bdf.get(&id).unwrap().clone();
+            Ok(PciDeviceInfo { id, bdf })
+        } else {
+            let device = self.make_virtio_block_device(disk_cfg, true, None)?;
+            self.hotplug_virtio_pci_device(device)
+        }
     }
 
     pub fn add_fs(&mut self, fs_cfg: &mut FsConfig) -> DeviceManagerResult<PciDeviceInfo> {

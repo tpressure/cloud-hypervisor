@@ -1568,6 +1568,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvme"
+version = "0.1.0"
+dependencies = [
+ "block",
+ "byteorder",
+ "libc",
+ "log",
+ "pci",
+ "serde",
+ "thiserror",
+ "uuid",
+ "vm-allocator",
+ "vm-device",
+ "vm-memory",
+ "vm-migration",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "object"
 version = "0.37.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2854,6 +2873,7 @@ dependencies = [
  "micro_http",
  "mshv-bindings",
  "net_util",
+ "nvme",
  "option_parser",
  "pci",
  "range_map_vec",

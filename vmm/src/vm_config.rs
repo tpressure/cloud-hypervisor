@@ -345,6 +345,25 @@ pub struct PciDeviceCommonConfig {
     pub pci_device_id: Option<u8>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum DiskTransport {
+    #[default]
+    Virtio,
+    Nvme,
+}
+
+impl std::str::FromStr for DiskTransport {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "virtio" => Ok(DiskTransport::Virtio),
+            "nvme" => Ok(DiskTransport::Nvme),
+            _ => Err(format!("Unknown disk transport: {}", s)),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DiskConfig {
     #[serde(flatten)]
@@ -383,6 +402,8 @@ pub struct DiskConfig {
     pub image_type: ImageType,
     #[serde(default)]
     pub lock_granularity: LockGranularityChoice,
+    #[serde(default)]
+    pub transport: DiskTransport,
 }
 
 impl ApplyLandlock for DiskConfig {
