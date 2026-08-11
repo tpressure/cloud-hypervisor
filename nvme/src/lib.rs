@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Barrier, Mutex};
 
 use byteorder::{ByteOrder, LittleEndian};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use pci::{
     BarReprogrammingParams, MsixCap, MsixConfig, MaybeMutInterruptSourceGroup, PciBarConfiguration,
     PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration, PciDevice,
@@ -310,6 +310,12 @@ pub struct NvmeController {
     /// MSI-X configuration
     msix_config: Arc<Mutex<MsixConfig>>,
 
+    /// MSI-X PCI capability (holds table/PBA offsets set by guest)
+    msix_cap: MsixCap,
+
+    /// MSI-X capability register index in config space
+    msix_cap_reg_idx: Option<usize>,
+
     /// Guest memory for DMA access
     guest_memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
 
@@ -324,6 +330,12 @@ pub struct NvmeController {
 
     /// Full CC register value (for read-back)
     cc: u32,
+
+    /// INTMS register (Interrupt Message Set)
+    intms: u32,
+
+    /// INTMC register (Interrupt Message Clear)
+    intmc: u32,
 
     /// Number of namespaces
     num_namespaces: u32,
@@ -407,15 +419,19 @@ impl NvmeController {
         );
 
         // Setup MSI-X capability
-        configuration
-            .add_capability(&MsixCap::new(
-                0,
-                MSI_X_VECTORS,
-                0,
-                0,
-                0,
-            ))
+        // BAR0 layout: 0x0000-0x0FFF registers, 0x1000-0x1FFF doorbells,
+        // 0x2000-0x5FFF MSI-X table, 0x6000+ PBA
+        let msix_cap = MsixCap::new(
+            0,          // table BAR indicator (BAR0)
+            MSI_X_VECTORS,
+            0x2000,     // table offset in BAR0
+            0,          // PBA BAR indicator (BAR0)
+            0x6000,     // PBA offset in BAR0
+        );
+        let msix_cap_offset = configuration
+            .add_capability(&msix_cap)
             .map_err(|e| Error::PciConfig(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        let msix_cap_reg_idx = Some((msix_cap_offset / 4) as usize);
 
         Ok(NvmeController {
             id,
@@ -425,11 +441,15 @@ impl NvmeController {
             interrupt_manager,
             interrupt_group: Some(interrupt_source_group),
             msix_config,
+            msix_cap,
+            msix_cap_reg_idx,
             guest_memory,
             admin_queue: NvmeQueue::new(),
             io_queues: vec![NvmeQueue::new(); MAX_IO_QUEUES as usize],
             cc_en: false,
             cc: 0,
+            intms: 0,
+            intmc: 0,
             num_namespaces: 1,
             namespace_capacity,
             disk_file,
@@ -591,8 +611,6 @@ impl NvmeController {
                     LittleEndian::read_u32(&aligned)
                 };
 
-                let new_en = (cc & 0x1) != 0;
-
                 self.cc = cc;
                 let new_en = (cc & 0x1) != 0;
 
@@ -620,7 +638,8 @@ impl NvmeController {
                     aligned[..data.len()].copy_from_slice(data);
                     LittleEndian::read_u32(&aligned)
                 };
-                info!("INTMS write: 0x{:x}", mask);
+                self.intms |= mask;
+                info!("INTMS write: 0x{:x} -> intms=0x{:x}", mask, self.intms);
             }
             INTMC_OFFSET => {
                 let mask = if data.len() >= 4 {
@@ -630,7 +649,8 @@ impl NvmeController {
                     aligned[..data.len()].copy_from_slice(data);
                     LittleEndian::read_u32(&aligned)
                 };
-                info!("INTMC write: 0x{:x}", mask);
+                self.intms &= !mask;
+                info!("INTMC write: 0x{:x} -> intms=0x{:x}", mask, self.intms);
             }
             AQA_OFFSET => {
                 let aqa = if data.len() >= 4 {
@@ -1133,7 +1153,7 @@ impl NvmeController {
         data[26] = 0; // No metadata, use LBAF[0]
 
         // Offset 27: Metadata Capability (MC)
-        data[27] = 0x3; // Extended | Separate
+        data[27] = 0; // No metadata
 
         // Offset 128: LBAF[0] - MS=0 (no metadata), DS=9 (512B), RP=1 (good)
         // LBAF struct: MS(uint16_t), DS(uint8_t), RP(uint8_t)
@@ -1242,14 +1262,12 @@ impl NvmeController {
         }
 
         if let Err(e) = self.write_prp(sqe.prp1(), sqe.prp2(), &data) {
-            warn!("PRP too small for read: {}; returning zeroed data", e);
-            // Zero out the PRP region to avoid returning garbage
-            let zero_len = self.prp_capacity(sqe.prp1(), sqe.prp2());
-            if zero_len > 0 {
-                let zeros = vec![0u8; zero_len as usize];
-                let _ = self.write_prp(sqe.prp1(), sqe.prp2(), &zeros);
+            warn!("PRP too small for read: {}; writing partial data", e);
+            // Write whatever fits in the PRP region
+            let cap = self.prp_capacity(sqe.prp1(), sqe.prp2());
+            if cap > 0 {
+                let _ = self.write_prp(sqe.prp1(), sqe.prp2(), &data[..cap as usize]);
             }
-            return (NVME_SC_SUCCESS, 0);
         }
 
         (NVME_SC_SUCCESS, 0)
@@ -1540,10 +1558,18 @@ impl NvmeController {
             }
         }
 
-        // Trigger MSI-X interrupt
-        if let Some(ref group) = self.interrupt_group {
-            if let Err(e) = group.trigger(cqid as InterruptIndex) {
-                error!("Failed to trigger MSI-X interrupt: {}", e);
+        // Trigger MSI-X interrupt if not masked
+        let msix = self.msix_config.lock().unwrap();
+        let interrupt_masked = msix.masked()
+            || msix.table_entries[cqid as usize].masked()
+            || (self.intms & (1 << cqid)) != 0;
+        drop(msix);
+
+        if !interrupt_masked {
+            if let Some(ref group) = self.interrupt_group {
+                if let Err(e) = group.trigger(cqid as InterruptIndex) {
+                    error!("Failed to trigger MSI-X interrupt: {}", e);
+                }
             }
         }
     }
@@ -1585,12 +1611,24 @@ impl NvmeSqe {
 
 impl BusDevice for NvmeController {
     fn read(&mut self, base: u64, offset: u64, data: &mut [u8]) {
-        info!("NVMe BusDevice::read base=0x{:x} offset=0x{:x}", base, offset);
         if offset < DBL_BASE_OFFSET {
             self.read_register(offset, data);
         } else {
-            warn!("Unexpected BAR0 read at offset 0x{:x}", offset);
-            data.fill(0);
+            let tbl_offset = self.msix_cap.table_offset() as u64;
+            let tbl_size = self.msix_cap.table_size() as u64 * 16;
+            let pba_offset = self.msix_cap.pba_offset() as u64;
+            let pba_size = ((self.msix_cap.table_size() as u64 / 64) + 1) * 8;
+
+            if tbl_offset <= offset && offset < tbl_offset + tbl_size {
+                let table_offset = offset - tbl_offset;
+                self.msix_config.lock().unwrap().read_table(table_offset, data);
+            } else if pba_offset <= offset && offset < pba_offset + pba_size {
+                let pba_offset_rel = offset - pba_offset;
+                self.msix_config.lock().unwrap().read_pba(pba_offset_rel, data);
+            } else {
+                warn!("Unexpected BAR0 read at offset 0x{:x}", offset);
+                data.fill(0);
+            }
         }
     }
 
@@ -1599,22 +1637,35 @@ impl BusDevice for NvmeController {
         if offset < DBL_BASE_OFFSET {
             self.write_register(offset, data);
         } else {
-            let db_offset = offset - DBL_BASE_OFFSET;
-            let sqid = (db_offset / DBL_STRIDE) as u16;
-            let new_value = if data.len() >= 2 {
-                LittleEndian::read_u16(data)
-            } else {
-                let mut aligned = [0u8; 2];
-                aligned[..data.len()].copy_from_slice(data);
-                LittleEndian::read_u16(&aligned)
-            };
+            let tbl_offset = self.msix_cap.table_offset() as u64;
+            let tbl_size = self.msix_cap.table_size() as u64 * 16;
+            let pba_offset = self.msix_cap.pba_offset() as u64;
+            let pba_size = ((self.msix_cap.table_size() as u64 / 64) + 1) * 8;
 
-            if (db_offset % DBL_STRIDE) < 4 {
-                info!("NVMe SQ{} doorbell tail={}", sqid, new_value);
-                self.process_sq_doorbell(sqid, new_value);
-            } else {
-                info!("NVMe CQ{} doorbell head={}", sqid, new_value);
-                self.process_cq_doorbell(sqid, new_value);
+            if tbl_offset <= offset && offset < tbl_offset + tbl_size {
+                let table_offset = offset - tbl_offset;
+                self.msix_config.lock().unwrap().write_table(table_offset, data);
+            } else if pba_offset <= offset && offset < pba_offset + pba_size {
+                let pba_offset_rel = offset - pba_offset;
+                self.msix_config.lock().unwrap().write_pba(pba_offset_rel, data);
+            } else if offset >= DBL_BASE_OFFSET {
+                let db_offset = offset - DBL_BASE_OFFSET;
+                let sqid = (db_offset / DBL_STRIDE) as u16;
+                let new_value = if data.len() >= 2 {
+                    LittleEndian::read_u16(data)
+                } else {
+                    let mut aligned = [0u8; 2];
+                    aligned[..data.len()].copy_from_slice(data);
+                    LittleEndian::read_u16(&aligned)
+                };
+
+                if (db_offset % DBL_STRIDE) < 4 {
+                    info!("NVMe SQ{} doorbell tail={}", sqid, new_value);
+                    self.process_sq_doorbell(sqid, new_value);
+                } else {
+                    info!("NVMe CQ{} doorbell head={}", sqid, new_value);
+                    self.process_cq_doorbell(sqid, new_value);
+                }
             }
         }
         None
@@ -1673,10 +1724,32 @@ impl PciDevice for NvmeController {
         offset: u64,
         data: &[u8],
     ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
-        (
-            self.configuration.write_config_register(reg_idx, offset, data),
-            None,
-        )
+        let bar_reprogramming = self.configuration.write_config_register(reg_idx, offset, data);
+
+        // Forward MSI-X capability writes to our MsixCap
+        if let Some(msix_reg_idx) = self.msix_cap_reg_idx {
+            if reg_idx == msix_reg_idx {
+                // First dword of MSI-X capability (bytes 0-3)
+                // Message Control is at byte offset 2 within the capability
+                if offset == 2 && data.len() == 2 {
+                    self.msix_cap.set_msg_ctl(LittleEndian::read_u16(data));
+                } else if offset == 0 && data.len() == 4 {
+                    self.msix_cap.set_msg_ctl((LittleEndian::read_u32(data) >> 16) as u16);
+                }
+            } else if reg_idx == msix_reg_idx + 1 {
+                // Second dword of MSI-X capability (bytes 4-7) = Table Offset
+                if offset == 0 && data.len() == 4 {
+                    self.msix_cap.table = LittleEndian::read_u32(data);
+                }
+            } else if reg_idx == msix_reg_idx + 2 {
+                // Third dword of MSI-X capability (bytes 8-11) = PBA Offset
+                if offset == 0 && data.len() == 4 {
+                    self.msix_cap.pba = LittleEndian::read_u32(data);
+                }
+            }
+        }
+
+        (bar_reprogramming, None)
     }
 
     fn read_config_register(&mut self, reg_idx: usize) -> u32 {
