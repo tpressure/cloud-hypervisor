@@ -153,37 +153,26 @@ const NVME_SC_ASYNC_EVT_REQ_LIMIT: u16 = 0x52;
 // ---------------------------------------------------------------------------
 
 /// NVMe Submission Queue Entry (64 bytes = 16 DWORDs)
+/// Field byte offsets match EDK2's NVME_SQ struct which places Prp[] at offset 24
+/// and Payload (CDW10-15) at offset 40, swapped relative to the NVMe spec.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct NvmeSqe {
-    /// DWORD 0: opcode (bits 0-7), flags (bits 8-15), command ID (bits 16-31)
     dword0: u32,
-    /// DWORD 1: FUSE (bits 0-15), reserved (bits 16-31)
     dword1: u32,
-    /// DWORD 2-3: Namespace ID (32 bits)
     nsid: u32,
-    /// DWORD 4: Reserved
     reserved1: u32,
-    /// DWORD 5: CDW10 (command-specific)
+    reserved2: u32,
     cdw10: u32,
-    /// DWORD 6: CDW11 (command-specific)
     cdw11: u32,
-    /// DWORD 7: CDW12 (reserved)
     cdw12: u32,
-    /// DWORD 8: CDW13 (reserved)
     cdw13: u32,
-    /// DWORD 9: CDW14 (reserved)
     cdw14: u32,
-    /// DWORD 10: PRP Entry 1 (lower 32 bits)
     prp1_lo: u32,
-    /// DWORD 11: PRP Entry 1 (upper 32 bits)
     prp1_hi: u32,
-    /// DWORD 12: PRP Entry 2 (lower 32 bits)
     prp2_lo: u32,
-    /// DWORD 13: PRP Entry 2 (upper 32 bits)
     prp2_hi: u32,
-    /// DWORD 14-15: Reserved (or DSM for Deallocate command)
-    reserved2: [u8; 8],
+    reserved3: [u8; 8],
 }
 
 impl NvmeSqe {
@@ -1623,11 +1612,14 @@ impl NvmeController {
 
 /// Parse SQE bytes into NvmeSqe struct (EDK2-compatible layout)
 fn parse_sqe(bytes: &[u8; 64]) -> NvmeSqe {
+    // EDK2's NVME_SQ struct has Prp[] at offset 24 and Payload (CDW10-15) at offset 40,
+    // which is swapped relative to the NVMe spec. We follow EDK2's layout.
     NvmeSqe {
         dword0: LittleEndian::read_u32(&bytes[0..4]),
         dword1: LittleEndian::read_u32(&bytes[4..8]),
         nsid: LittleEndian::read_u32(&bytes[8..12]),
         reserved1: LittleEndian::read_u32(&bytes[12..16]),
+        reserved2: LittleEndian::read_u32(&bytes[16..20]),
         cdw10: LittleEndian::read_u32(&bytes[40..44]),
         cdw11: LittleEndian::read_u32(&bytes[44..48]),
         cdw12: LittleEndian::read_u32(&bytes[48..52]),
@@ -1637,7 +1629,7 @@ fn parse_sqe(bytes: &[u8; 64]) -> NvmeSqe {
         prp1_hi: LittleEndian::read_u32(&bytes[28..32]),
         prp2_lo: LittleEndian::read_u32(&bytes[32..36]),
         prp2_hi: LittleEndian::read_u32(&bytes[36..40]),
-        reserved2: [0; 8],
+        reserved3: [0; 8],
     }
 }
 
