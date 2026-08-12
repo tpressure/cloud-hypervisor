@@ -243,6 +243,8 @@ struct NvmeQueue {
     cq_count: u32,
     /// Completion queue phase bit
     cq_phase: bool,
+    /// MSI-X vector assigned by guest (from Create CQ CDW11[16:31])
+    vector: u16,
     /// Whether this queue is allocated
     allocated: bool,
 }
@@ -258,6 +260,7 @@ impl NvmeQueue {
             cq_tail: 0,
             cq_count: 0,
             cq_phase: false,
+            vector: 0,
             allocated: false,
         }
     }
@@ -446,8 +449,7 @@ impl NvmeController {
             guest_memory,
             admin_queue: {
                 let mut q = NvmeQueue::new();
-                // Start with phase=true so EDK2 (which polls for Pt change from
-                // initial 0) detects the first admin completions.
+                /* Start admin queue at phase 1 to match guest expectations. */
                 q.cq_phase = true;
                 q
             },
@@ -969,7 +971,6 @@ impl NvmeController {
         queue.sq_addr = Some(GuestAddress(sqe.prp1()));
         queue.queue_size = qsize + 1;
         queue.allocated = true;
-        queue.cq_phase = pc != 0;
 
         info!(
             "NVMe Created SQ {} -> CQ {}, size={}, PC={}",
@@ -985,6 +986,7 @@ impl NvmeController {
         let cqid = (sqe.cdw10 & 0xFFFF) as u16;
         let qsize = ((sqe.cdw10 >> 16) as u16) + 1;
         let pc = sqe.cdw11 & 0x1;
+        let vector = (sqe.cdw11 >> 16) as u16;
 
         if cqid == 0 || cqid > self.max_io_queues {
             return (NVME_SC_INVALID_FIELD, 0);
@@ -993,9 +995,11 @@ impl NvmeController {
         let queue = &mut self.io_queues[cqid as usize - 1];
         queue.cq_addr = Some(GuestAddress(sqe.prp1()));
         queue.queue_size = qsize;
+        /* Start controller phase matching guest's PC so first CQEs are recognized. */
         queue.cq_phase = pc != 0;
+        queue.vector = vector;
 
-        info!("NVMe Created CQ {}, size={}, PC={}", cqid, qsize, pc);
+        info!("NVMe Created CQ {}, size={}, PC={}, vector={}", cqid, qsize, pc, vector);
         (NVME_SC_SUCCESS, 0)
     }
 
@@ -1594,15 +1598,17 @@ impl NvmeController {
         }
 
         // Trigger MSI-X interrupt if not masked
+        // Linux uses Linux IRQ subsystem for masking (disable_irq/enable_irq),
+        // which maps to MSI-X table entry mask bit. No INTMS/INTMC check needed.
+        let vector = if cqid == 0 { 0 } else { self.io_queues[cqid as usize - 1].vector };
         let msix = self.msix_config.lock().unwrap();
         let interrupt_masked = msix.masked()
-            || msix.table_entries[cqid as usize].masked()
-            || (self.intms & (1 << cqid)) == 0;
+            || msix.table_entries[vector as usize].masked();
         drop(msix);
 
         if !interrupt_masked {
             if let Some(ref group) = self.interrupt_group {
-                if let Err(e) = group.trigger(cqid as InterruptIndex) {
+                if let Err(e) = group.trigger(vector as InterruptIndex) {
                     error!("Failed to trigger MSI-X interrupt: {}", e);
                 }
             }
