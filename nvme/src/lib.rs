@@ -98,14 +98,11 @@ const PBA_SIZE: u64 = 0x80;
 /// Doorbell region starts at offset 0x1000 within BAR0 (NVMe spec §3.1.25)
 const DBL_BASE_OFFSET: u64 = 0x1000;
 
-/// Maximum number of I/O submission queues (NVMe spec: 1023)
-const MAX_IO_QUEUES: u16 = 1023;
+/// Maximum number of I/O submission queues allowed by NVMe spec
+const NVME_MAX_IO_QUEUES: u16 = 1023;
 
 /// Logical block size for the namespace
 const LBA_SIZE: u64 = 512;
-
-/// Number of MSI-X vectors: 1 admin + MAX_IO_QUEUES I/O
-const MSI_X_VECTORS: u16 = 1 + MAX_IO_QUEUES;
 
 // Controller register offsets (NVMe spec §3.1, per EDK2 Nvme.h)
 const CAP_OFFSET: u64 = 0x0000;   // 8 bytes
@@ -253,6 +250,8 @@ struct NvmeQueue {
     sq_tail: u16,
     /// Completion queue tail (points to next free slot)
     cq_tail: u16,
+    /// Total CQEs written (for spec-compliant phase tag: PT = (cq_count / queue_size) & 1)
+    cq_count: u32,
     /// Completion queue phase bit
     cq_phase: bool,
     /// Whether this queue is allocated
@@ -268,7 +267,8 @@ impl NvmeQueue {
             sq_head: 0,
             sq_tail: 0,
             cq_tail: 0,
-             cq_phase: false,
+            cq_count: 0,
+            cq_phase: false,
             allocated: false,
         }
     }
@@ -355,6 +355,12 @@ pub struct NvmeController {
     /// PCI BDF for MSI-X setup
     pci_device_bdf: u8,
 
+    /// Maximum number of I/O queues (derived from vCPU count)
+    max_io_queues: u16,
+
+    /// Number of MSI-X vectors (1 admin + max_io_queues)
+    msix_vectors: u16,
+
     /// Partial 64-bit register write buffers (firmware may write as two 32-bit accesses)
     asq_lo: u32,
     asq_hi: u32,
@@ -370,6 +376,7 @@ impl NvmeController {
         interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
         guest_memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
         pci_device_bdf: u8,
+        num_vcpus: u32,
     ) -> Result<Self> {
         let disk_file = OpenOptions::new()
             .read(true)
@@ -384,17 +391,21 @@ impl NvmeController {
 
         let namespace_capacity = disk_size / LBA_SIZE;
 
+        // Limit I/O queues to vCPU count to avoid creating too many EventFds
+        let max_io_queues = (num_vcpus as u16).min(NVME_MAX_IO_QUEUES);
+        let msix_vectors = 1 + max_io_queues;
+
         // Create MSI-X interrupt group
         let interrupt_source_group: Arc<dyn InterruptSourceGroup> = interrupt_manager
             .create_group(MsiIrqGroupConfig {
                 base: 0,
-                count: MSI_X_VECTORS as InterruptIndex,
+                count: msix_vectors as InterruptIndex,
             })
             .map_err(Error::InterruptGroup)?;
 
         let msix_config = Arc::new(Mutex::new(
             MsixConfig::new(
-                MSI_X_VECTORS,
+                msix_vectors,
                 MaybeMutInterruptSourceGroup::Immutable(interrupt_source_group.clone()),
                 pci_device_bdf as u32,
                 None,
@@ -422,11 +433,11 @@ impl NvmeController {
         // BAR0 layout: 0x0000-0x0FFF registers, 0x1000-0x1FFF doorbells,
         // 0x2000-0x5FFF MSI-X table, 0x6000+ PBA
         let msix_cap = MsixCap::new(
-            0,          // table BAR indicator (BAR0)
-            MSI_X_VECTORS,
-            0x2000,     // table offset in BAR0
-            0,          // PBA BAR indicator (BAR0)
-            0x6000,     // PBA offset in BAR0
+            0,            // table BAR indicator (BAR0)
+            msix_vectors,
+            0x2000,       // table offset in BAR0
+            0,            // PBA BAR indicator (BAR0)
+            0x6000,       // PBA offset in BAR0
         );
         let msix_cap_offset = configuration
             .add_capability(&msix_cap)
@@ -444,8 +455,14 @@ impl NvmeController {
             msix_cap,
             msix_cap_reg_idx,
             guest_memory,
-            admin_queue: NvmeQueue::new(),
-            io_queues: vec![NvmeQueue::new(); MAX_IO_QUEUES as usize],
+            admin_queue: {
+                let mut q = NvmeQueue::new();
+                // Start with phase=true so EDK2 (which polls for Pt change from
+                // initial 0) detects the first admin completions.
+                q.cq_phase = true;
+                q
+            },
+            io_queues: vec![NvmeQueue::new(); max_io_queues as usize],
             cc_en: false,
             cc: 0,
             intms: 0,
@@ -456,6 +473,8 @@ impl NvmeController {
             disk_readonly,
             namespace_uuid: Uuid::new_v4(),
             pci_device_bdf,
+            max_io_queues,
+            msix_vectors,
             asq_lo: 0,
             asq_hi: 0,
             acq_lo: 0,
@@ -470,7 +489,7 @@ impl NvmeController {
     fn read_register(&self, offset: u64, data: &mut [u8]) {
         // Handle 64-bit registers that may be read as two 32-bit accesses
         if offset >= CAP_OFFSET && offset < CAP_OFFSET + 8 {
-            let cap: u64 = 0x0000_0020_0000_0018;
+             let cap: u64 = 0x0040_0020_0000_01FF;
             let cap_offset = offset - CAP_OFFSET;
             if cap_offset == 0 && data.len() >= 8 {
                 LittleEndian::write_u64(data, cap);
@@ -622,7 +641,8 @@ impl NvmeController {
                         self.admin_queue.sq_head = 0;
                         self.admin_queue.sq_tail = 0;
                         self.admin_queue.cq_tail = 0;
-                        self.admin_queue.cq_phase = false;
+                        self.admin_queue.cq_count = 0;
+                        self.admin_queue.cq_phase = true;
                         for queue in self.io_queues.iter_mut() {
                             *queue = NvmeQueue::new();
                         }
@@ -749,7 +769,7 @@ impl NvmeController {
 
         let queue = if sqid == 0 {
             &mut self.admin_queue
-        } else if sqid <= MAX_IO_QUEUES {
+        } else if sqid <= self.max_io_queues {
             &mut self.io_queues[sqid as usize - 1]
         } else {
             warn!("Invalid SQ ID {}", sqid);
@@ -783,7 +803,7 @@ impl NvmeController {
 
         let _queue = if cqid == 0 {
             &mut self.admin_queue
-        } else if cqid <= MAX_IO_QUEUES {
+        } else if cqid <= self.max_io_queues {
             &mut self.io_queues[cqid as usize - 1]
         } else {
             return;
@@ -916,7 +936,7 @@ impl NvmeController {
 
     fn admin_delete_sq(&mut self, sqe: &NvmeSqe) -> (u16, u32) {
         let sqid = sqe.command_id();
-        if sqid == 0 || sqid > MAX_IO_QUEUES {
+        if sqid == 0 || sqid > self.max_io_queues {
             return (NVME_SC_INVALID_FIELD, 0);
         }
         if !self.io_queues[sqid as usize - 1].allocated {
@@ -938,7 +958,7 @@ impl NvmeController {
             sqid, qsize, pc, cqid
         );
 
-        if sqid == 0 || sqid > MAX_IO_QUEUES {
+        if sqid == 0 || sqid > self.max_io_queues {
             info!("NVMe Create SQ rejected: SQID out of range");
             return (NVME_SC_INVALID_FIELD, 0);
         }
@@ -977,7 +997,7 @@ impl NvmeController {
         let qsize = ((sqe.cdw10 >> 16) as u16) + 1;
         let pc = sqe.cdw11 & 0x1;
 
-        if cqid == 0 || cqid > MAX_IO_QUEUES {
+        if cqid == 0 || cqid > self.max_io_queues {
             return (NVME_SC_INVALID_FIELD, 0);
         }
 
@@ -1229,11 +1249,9 @@ impl NvmeController {
     }
 
     fn io_read(&mut self, sqe: &NvmeSqe) -> (u16, u32) {
-        // CDW10 bits 0-15: Starting LBA (low 16 bits)
-        // CDW10 bits 16-31: Length (number of blocks - 1)
-        // CDW11 bits 0-31: Starting LBA (high 32 bits)
-        let slba = (sqe.cdw10 as u64 & 0xFFFF) | ((sqe.cdw11 as u64) << 16);
-        let length = ((sqe.cdw10 >> 16) & 0xFFFF) as u32 + 1;
+        // NVMe READ: CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12=NLB[15:0]|Control[31:16]
+        let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+        let length = (sqe.cdw12 & 0xFFFF) as u32 + 1;
         let nsid = if sqe.nsid == 0 { 1 } else { sqe.nsid };
         info!("Read: NSID={} SLBA={} length={} PRP1=0x{:x} PRP2=0x{:x}", nsid, slba, length, sqe.prp1(), sqe.prp2());
 
@@ -1269,6 +1287,7 @@ impl NvmeController {
                 let _ = self.write_prp(sqe.prp1(), sqe.prp2(), &data[..cap as usize]);
             }
         }
+        info!("Read SLBA={} wrote {} bytes, first 16: {:02x?}", slba, data.len(), &data[..std::cmp::min(16, data.len())]);
 
         (NVME_SC_SUCCESS, 0)
     }
@@ -1278,14 +1297,13 @@ impl NvmeController {
             return (NVME_SC_INVALID_FIELD, 0);
         }
 
-        // CDW10 bits 0-15: Starting LBA (low 16 bits)
-        // CDW10 bits 16-31: Length (number of blocks - 1)
-        // CDW11 bits 0-31: Starting LBA (high 32 bits)
-        let slba = (sqe.cdw10 as u64 & 0xFFFF) | ((sqe.cdw11 as u64) << 16);
-        let length = ((sqe.cdw10 >> 16) & 0xFFFF) as u32 + 1;
-        info!("Write: SLBA={}, length={}", slba, length);
+        // NVMe WRITE: CDW10=SLBA[31:0], CDW11=SLBA[63:32], CDW12=NLB[15:0]|Control[31:16]
+        let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
+        let length = (sqe.cdw12 & 0xFFFF) as u32 + 1;
+        let nsid = if sqe.nsid == 0 { 1 } else { sqe.nsid };
+        info!("Write: NSID={} SLBA={} length={}", nsid, slba, length);
 
-        if sqe.nsid != 1 {
+        if nsid != 1 {
             return (NVME_SC_INVALID_NS, 0);
         }
 
@@ -1349,27 +1367,43 @@ impl NvmeController {
 
         // PRP2: Either a second page or a PRP list
         if prp2 == 0 {
+            // If PRP1 was not page-aligned, the next page is used automatically
+            if prp1_page_offset != 0 {
+                let next_page = prp1 - prp1_page_offset + NVME_PAGE_SIZE;
+                let remaining = buf.len() - offset;
+                if remaining as u64 > NVME_PAGE_SIZE {
+                    return Err(Error::InvalidPrpList);
+                }
+                if remaining > 0 {
+                    let mut page_buf = vec![0u8; remaining];
+                    guest_mem
+                        .read(&mut page_buf[..], GuestAddress(next_page))
+                        .map_err(Error::GuestMemory)?;
+                    buf[offset..].copy_from_slice(&page_buf);
+                }
+                return Ok(());
+            }
             return Err(Error::InvalidPrpList);
         }
 
-        if prp2 & 1 == 0 {
-            // Second physical region page (must be page-aligned)
-            let remaining = buf.len() - offset;
-            let page_size = std::cmp::min(remaining as u64, NVME_PAGE_SIZE);
-            if page_size > 0 {
-                let mut page_buf = vec![0u8; page_size as usize];
+        // NVMe spec: if remaining data fits in one page, PRP2 is a direct page;
+        // otherwise PRP2 points to a PRP list
+        let remaining_after_prp1 = buf.len() - offset;
+        if remaining_after_prp1 as u64 <= NVME_PAGE_SIZE {
+            // PRP2 is a direct second page
+            if remaining_after_prp1 > 0 {
+                let mut page_buf = vec![0u8; remaining_after_prp1];
                 guest_mem
                     .read(&mut page_buf[..], GuestAddress(prp2))
                     .map_err(Error::GuestMemory)?;
-                buf[offset..offset + page_size as usize].copy_from_slice(&page_buf);
+                buf[offset..].copy_from_slice(&page_buf);
             }
         } else {
-            // PRP list (bit 0 set indicates list)
-            let mut prp_list_addr = prp2 & !1;
-            let mut remaining = buf.len() - offset;
+            // PRP2 is a PRP list pointer
+            let mut prp_list_addr = prp2;
+            let mut remaining = remaining_after_prp1;
 
             while remaining > 0 {
-                // Read next PRP entry from the list
                 let mut prp_entry_bytes = [0u8; 8];
                 guest_mem
                     .read(&mut prp_entry_bytes, GuestAddress(prp_list_addr))
@@ -1389,7 +1423,7 @@ impl NvmeController {
                 offset += page_size as usize;
                 remaining -= page_size as usize;
 
-                prp_list_addr += 8; // Next entry in the list
+                prp_list_addr += 8;
             }
         }
 
@@ -1457,22 +1491,22 @@ impl NvmeController {
             return Err(Error::InvalidPrpList);
         }
 
-        if prp2 & 1 == 0 {
-            // Second physical region page (must be page-aligned)
-            let remaining = buf.len() - offset;
-            let page_size = std::cmp::min(remaining as u64, NVME_PAGE_SIZE);
-            if page_size > 0 {
+        // NVMe spec: if remaining data fits in one page, PRP2 is a direct page pointer;
+        // otherwise PRP2 points to a PRP list. No bit-0 convention.
+        let remaining_after_prp1 = buf.len() - offset;
+        if remaining_after_prp1 as u64 <= NVME_PAGE_SIZE {
+            // PRP2 is a direct second page
+            if remaining_after_prp1 > 0 {
                 guest_mem
-                    .write(&buf[offset..offset + page_size as usize], GuestAddress(prp2))
+                    .write(&buf[offset..], GuestAddress(prp2))
                     .map_err(Error::GuestMemory)?;
             }
         } else {
-            // PRP list (bit 0 set indicates list)
-            let mut prp_list_addr = prp2 & !1;
-            let mut remaining = buf.len() - offset;
+            // PRP2 is a PRP list pointer
+            let mut prp_list_addr = prp2;
+            let mut remaining = remaining_after_prp1;
 
             while remaining > 0 {
-                // Read next PRP entry from the list
                 let mut prp_entry_bytes = [0u8; 8];
                 guest_mem
                     .read(&mut prp_entry_bytes, GuestAddress(prp_list_addr))
@@ -1490,7 +1524,7 @@ impl NvmeController {
                 offset += page_size as usize;
                 remaining -= page_size as usize;
 
-                prp_list_addr += 8; // Next entry in the list
+                prp_list_addr += 8;
             }
         }
 
@@ -1514,17 +1548,26 @@ impl NvmeController {
 
         let guest_mem = self.guest_memory.memory();
         let cq_addr = queue.cq_addr.unwrap();
-        let tail = if cqid == 0 {
-            self.admin_queue.cq_tail
+
+        // EDK2's sync PassThru (NvmExpressPassthru.c:868) advances Cqh ^= 1 after
+        // each completion and toggles Pt ^= 1 when Cqh wraps to 0. For a queue of
+        // size 2: CID=0 at slot 0, CID=1 at slot 1, CID=2 at slot 0 with Pt toggled.
+        // We must use tail-based slot calculation AND flip phase on wrap to match.
+        let (cq_offset, phase) = if cqid == 0 {
+            let tail = self.admin_queue.cq_tail;
+            let offset = (tail % queue.queue_size) as u64 * 16;
+            (offset, queue.cq_phase)
         } else {
-            self.io_queues[cqid as usize - 1].cq_tail
+            let queue = &self.io_queues[cqid as usize - 1];
+            let tail = queue.cq_tail;
+            let offset = (tail % queue.queue_size) as u64 * 16;
+            (offset, queue.cq_phase)
         };
 
-        let cq_offset = (tail % queue.queue_size) as u64 * 16;
         let cqe_addr = GuestAddress(cq_addr.0 + cq_offset);
-        info!("NVMe enqueue_completion cqid={} cid={} status=0x{:04x} cq_addr=0x{:x} offset={} cqe_addr=0x{:x} phase={}", cqid, cid, status, cq_addr.raw_value(), cq_offset, cqe_addr.raw_value(), queue.cq_phase);
+        info!("NVMe enqueue_completion cqid={} cid={} status=0x{:04x} cq_addr=0x{:x} offset={} cqe_addr=0x{:x} phase={}", cqid, cid, status, cq_addr.raw_value(), cq_offset, cqe_addr.raw_value(), phase);
 
-        let cqe = NvmeCqe::new(cid, queue.cq_phase, status, sq_id, 0, result);
+        let cqe = NvmeCqe::new(cid, phase, status, sq_id, 0, result);
         let mut cqe_bytes = [0u8; 16];
         // SAFETY: NvmeCqe is a simple struct with no padding issues, and we're
         // copying exactly 16 bytes which matches the struct size.
@@ -1542,17 +1585,20 @@ impl NvmeController {
             return;
         }
 
-        // Advance CQ tail and flip phase tag when wrapping
+        // Advance CQ tail and flip phase on wrap.
+        // EDK2's sync PassThru (NvmExpressPassthru.c:868) does:
+        //   if ((Cqh ^= 1) == 0) Pt ^= 1;
+        // which toggles Pt when Cqh wraps. We match this by flipping phase on wrap.
         if cqid == 0 {
             let old_tail = self.admin_queue.cq_tail;
-            self.admin_queue.cq_tail = (self.admin_queue.cq_tail + 1) % self.admin_queue.queue_size;
+            self.admin_queue.cq_tail = (old_tail + 1) % self.admin_queue.queue_size;
             if self.admin_queue.cq_tail < old_tail {
                 self.admin_queue.cq_phase ^= true;
             }
         } else {
             let queue = &mut self.io_queues[cqid as usize - 1];
             let old_tail = queue.cq_tail;
-            queue.cq_tail = (queue.cq_tail + 1) % queue.queue_size;
+            queue.cq_tail = (old_tail + 1) % queue.queue_size;
             if queue.cq_tail < old_tail {
                 queue.cq_phase ^= true;
             }
@@ -1562,7 +1608,7 @@ impl NvmeController {
         let msix = self.msix_config.lock().unwrap();
         let interrupt_masked = msix.masked()
             || msix.table_entries[cqid as usize].masked()
-            || (self.intms & (1 << cqid)) != 0;
+            || (self.intms & (1 << cqid)) == 0;
         drop(msix);
 
         if !interrupt_masked {

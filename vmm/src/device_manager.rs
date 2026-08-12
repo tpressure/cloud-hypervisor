@@ -3313,6 +3313,7 @@ impl DeviceManager {
             self.msi_interrupt_manager.clone(),
             self.memory_manager.lock().unwrap().guest_memory(),
             pci_device_bdf.device(),
+            self.config.lock().unwrap().cpus.boot_vcpus,
         )
         .map_err(DeviceManagerError::Nvme)?));
 
