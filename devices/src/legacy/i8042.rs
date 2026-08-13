@@ -163,6 +163,7 @@ impl KeyboardMap {
 
             // Punctuation / symbols
             0x20 => (0x39, false), // Space
+            0x21 => (0x02, false), // Exclamation (!)
             0x60 => (0x29, false), // Grave (`)
             0x2D => (0x0C, false), // Minus (-)
             0x3D => (0x0D, false), // Equals (=)
@@ -1237,6 +1238,23 @@ mod tests {
         dev.process_keyboard_event(0x71, false);
         assert_eq!(dev.output_buffer.len(), 2);
         assert_eq!(dev.output_buffer[1], 0x90);
+    }
+
+    #[test]
+    fn test_exclamation_scan_codes() {
+        let mut dev = make_device();
+
+        // X11 keysym 0x21 ('!') uses the physical '1' key. The VNC client
+        // sends Shift as a separate keyboard event.
+        dev.process_keyboard_event(0x21, true);
+        dev.process_keyboard_event(0x21, false);
+        assert_eq!(dev.output_buffer, VecDeque::from([0x02, 0x82]));
+
+        let mut dev = make_device();
+        dev.ctr &= !CTR_XLATE;
+        dev.process_keyboard_event(0x21, true);
+        dev.process_keyboard_event(0x21, false);
+        assert_eq!(dev.output_buffer, VecDeque::from([0x16, 0xF0, 0x16]));
     }
 
     #[test]
