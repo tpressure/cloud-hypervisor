@@ -891,6 +891,13 @@ impl PciConfiguration {
                 self.msix_cap_reg_idx = Some(cap_offset / 4);
                 self.writable_bits[self.msix_cap_reg_idx.unwrap()] = MSIX_CAPABILITY_REGISTER_MASK;
             }
+            // PM Control/Status Register is at byte offset 4 within the capability,
+            // which is the lower 16 bits of the second 32-bit register.
+            // Allow writes to the device power-state field. PME is not writable
+            // without device-specific PME and write-one-to-clear handling.
+            PciCapabilityId::PowerManagement => {
+                self.writable_bits[cap_offset / 4 + 1] |= 0x0000_0003;
+            }
             _ => {}
         }
 

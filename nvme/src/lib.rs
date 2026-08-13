@@ -17,17 +17,16 @@ use std::sync::{Arc, Barrier, Mutex};
 use byteorder::{ByteOrder, LittleEndian};
 use log::{error, info, warn};
 use pci::{
-    BarReprogrammingParams, MsixCap, MsixConfig, MaybeMutInterruptSourceGroup, PciBarConfiguration,
-    PciBarPrefetchable, PciBarRegionType, PciClassCode, PciConfiguration, PciDevice,
-    PciDeviceError, PciHeaderType, PciMassStorageSubclass, PciProgrammingInterface, PciSubclass,
+    BarReprogrammingParams, MaybeMutInterruptSourceGroup, MsixCap, MsixConfig, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciCapability,
+    PciCapabilityId, PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciMassStorageSubclass, PciProgrammingInterface, PciSubclass,
 };
 use thiserror::Error;
 use uuid::Uuid;
 use vm_allocator::{AddressAllocator, SystemAllocator};
 use vm_device::interrupt::{InterruptIndex, InterruptManager, InterruptSourceGroup, MsiIrqGroupConfig};
 use vm_device::{BusDevice, Resource};
-use vm_memory::{Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryError, GuestMemoryMmap};
 use vm_memory::bitmap::AtomicBitmap;
+use vm_memory::{Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryError, GuestMemoryMmap};
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -84,38 +83,35 @@ const NVME_PAGE_SIZE: u64 = 4096;
 /// BAR0 size: 64KB to fit registers, MSI-X table, PBA, and doorbells
 const BAR0_SIZE: u64 = 0x10000;
 
-/// Doorbell stride (CAP.DSTRD = 0b011 -> 2^3 * 4 = 32 bytes)
-const DBL_STRIDE: u64 = 8;
+/// Doorbell configuration: DSTRD=2, so each doorbell occupies a 16-byte stride.
+const DBL_STRIDE: u64 = 16;
 
-/// MSI-X table offset within BAR0 (16KB for 1024 vectors)
-const MSI_X_TABLE_OFFSET: u64 = 0x3000;
-const MSI_X_TABLE_SIZE: u64 = 0x4000;
-
-/// PBA offset within BAR0 (128 bytes)
-const PBA_OFFSET: u64 = 0x7000;
-const PBA_SIZE: u64 = 0x80;
+/// BAR0 layout:
+/// 0x0000-0x0FFF: registers (4KB)
+/// 0x1000-0x17FF: doorbells (64 queue pairs, two doorbells per pair)
+/// 0x2000-0x23FF: MSI-X table (64 entries)
+/// 0x6000-0x6007: PBA (one 64-bit entry)
+const MSI_X_TABLE_OFFSET: u64 = 0x2000;
+const PBA_OFFSET: u64 = 0x6000;
 
 /// Doorbell region starts at offset 0x1000 within BAR0 (NVMe spec §3.1.25)
 const DBL_BASE_OFFSET: u64 = 0x1000;
-
-/// Maximum number of I/O submission queues allowed by NVMe spec
-const NVME_MAX_IO_QUEUES: u16 = 1023;
 
 /// Logical block size for the namespace
 const LBA_SIZE: u64 = 512;
 
 // Controller register offsets (NVMe spec §3.1, per EDK2 Nvme.h)
-const CAP_OFFSET: u64 = 0x0000;   // 8 bytes
-const VS_OFFSET: u64 = 0x0008;   // 4 bytes
+const CAP_OFFSET: u64 = 0x0000; // 8 bytes
+const VS_OFFSET: u64 = 0x0008; // 4 bytes
 const INTMS_OFFSET: u64 = 0x000C; // 4 bytes
 const INTMC_OFFSET: u64 = 0x0010; // 4 bytes
-const CC_OFFSET: u64 = 0x0014;   // 4 bytes
+const CC_OFFSET: u64 = 0x0014; // 4 bytes
 // 0x18-0x1B: reserved (4 bytes)
 const CSTS_OFFSET: u64 = 0x001C; // 4 bytes
 const NSSR_OFFSET: u64 = 0x0020; // 4 bytes
-const AQA_OFFSET: u64 = 0x0024;  // 4 bytes
-const ASQ_OFFSET: u64 = 0x0028;  // 8 bytes
-const ACQ_OFFSET: u64 = 0x0030;  // 8 bytes
+const AQA_OFFSET: u64 = 0x0024; // 4 bytes
+const ASQ_OFFSET: u64 = 0x0028; // 8 bytes
+const ACQ_OFFSET: u64 = 0x0030; // 8 bytes
 
 // NVMe I/O command opcodes
 const NVME_CMD_FLUSH: u8 = 0x00;
@@ -138,15 +134,23 @@ const NVME_ADMIN_SET_FEATURES: u8 = 0x09;
 const NVME_ADMIN_GET_FEATURES: u8 = 0x0A;
 const NVME_ADMIN_ASYNC_EVENT_REQ: u8 = 0x0C;
 
+// NVMe feature identifiers
+const NVME_FEAT_NUM_QUEUES: u8 = 0x07;
+
 // NVMe completion status codes (§5.1.2, §6.1.2)
 const NVME_SC_SUCCESS: u16 = 0x0;
 const NVME_SC_INVALID_OPCODE: u16 = 0x1;
 const NVME_SC_INVALID_FIELD: u16 = 0x2;
+const NVME_SC_ABORT_REQ: u16 = 0x7;
 const NVME_SC_CMD_ID_CONFLICT: u16 = 0x9;
 const NVME_SC_DATA_SGL_LEN: u16 = 0xD;
 const NVME_SC_INVALID_NS: u16 = 0xC;
 const NVME_SC_INTERNAL_ERROR: u16 = 0x11;
-const NVME_SC_ASYNC_EVT_REQ_LIMIT: u16 = 0x52;
+const NVME_SC_ASYNC_EVT_REQ_LIMIT: u16 = 0x105;
+
+// AERL is zero-based, so this permits nine outstanding requests.
+const NVME_AERL: u8 = 8;
+const NVME_MAX_ASYNC_EVENT_REQUESTS: usize = NVME_AERL as usize + 1;
 
 // ---------------------------------------------------------------------------
 // NVMe data structures
@@ -243,8 +247,12 @@ struct NvmeQueue {
     cq_count: u32,
     /// Completion queue phase bit
     cq_phase: bool,
+    /// Completion queue associated with this submission queue.
+    cqid: u16,
     /// MSI-X vector assigned by guest (from Create CQ CDW11[16:31])
     vector: u16,
+    /// Whether the completion queue has interrupts enabled.
+    interrupt_enabled: bool,
     /// Whether this queue is allocated
     allocated: bool,
 }
@@ -260,7 +268,9 @@ impl NvmeQueue {
             cq_tail: 0,
             cq_count: 0,
             cq_phase: false,
+            cqid: 0,
             vector: 0,
+            interrupt_enabled: false,
             allocated: false,
         }
     }
@@ -273,6 +283,52 @@ struct NvmehciProgrammingInterface;
 impl PciProgrammingInterface for NvmehciProgrammingInterface {
     fn get_register_value(&self) -> u8 {
         0x02
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PCI Power Management capability
+// ---------------------------------------------------------------------------
+
+/// PCI Power Management capability payload. `add_capability` supplies the
+/// two-byte capability header, making this an eight-byte capability.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct PmCap {
+    pmc: u16,
+    pmcsr: u16,
+    pmcsr_bse: u8,
+    data: u8,
+}
+
+// SAFETY: All members are simple numbers and any value is valid.
+unsafe impl ByteValued for PmCap {}
+
+impl PciCapability for PmCap {
+    fn bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+
+    fn id(&self) -> PciCapabilityId {
+        PciCapabilityId::PowerManagement
+    }
+}
+
+impl PmCap {
+    fn new() -> Self {
+        // PMC: PM version 1.2 (bits 2:0 = 0x3), with no optional D1/D2 states,
+        // PME support, or auxiliary power.
+        const PMC: u16 = 0x0003;
+        // PMCSR: NO_SOFT_RESET (bit 3) — no software reset on D3hot→D0
+        // transition. Device state starts at D0 (bits 1:0 = 0).
+        const PMCSR: u16 = 0x0008;
+
+        PmCap {
+            pmc: PMC,
+            pmcsr: PMCSR,
+            pmcsr_bse: 0,
+            data: 0,
+        }
     }
 }
 
@@ -317,6 +373,9 @@ pub struct NvmeController {
     /// I/O submission/completion queue pairs (indexed by queue ID - 1)
     io_queues: Vec<NvmeQueue>,
 
+    /// Async Event Requests awaiting an event to report.
+    pending_async_event_requests: Vec<u16>,
+
     /// Controller Configuration (CC.EN)
     cc_en: bool,
 
@@ -350,6 +409,10 @@ pub struct NvmeController {
     /// Maximum number of I/O queues (derived from vCPU count)
     max_io_queues: u16,
 
+    /// Number of I/O queues allocated through Set Features.
+    num_io_submission_queues: u16,
+    num_io_completion_queues: u16,
+
     /// Number of MSI-X vectors (1 admin + max_io_queues)
     msix_vectors: u16,
 
@@ -368,23 +431,18 @@ impl NvmeController {
         interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
         guest_memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
         pci_device_bdf: u8,
-        num_vcpus: u32,
+        _num_vcpus: u32,
     ) -> Result<Self> {
-        let disk_file = OpenOptions::new()
-            .read(true)
-            .write(!disk_readonly)
-            .open(&disk_path)
-            .map_err(Error::DiskFile)?;
+        let disk_file = OpenOptions::new().read(true).write(!disk_readonly).open(&disk_path).map_err(Error::DiskFile)?;
 
-        let disk_size = disk_file
-            .metadata()
-            .map_err(Error::DiskFile)?
-            .len();
+        let disk_size = disk_file.metadata().map_err(Error::DiskFile)?.len();
 
         let namespace_capacity = disk_size / LBA_SIZE;
 
-        // Limit I/O queues to vCPU count to avoid creating too many EventFds
-        let max_io_queues = (num_vcpus as u16).min(NVME_MAX_IO_QUEUES);
+        // Support multiple I/O queues regardless of vCPU count.
+        // Windows and other guests may create more queues than vCPUs.
+        const NVME_DEFAULT_MAX_IO_QUEUES: u16 = 63;
+        let max_io_queues = NVME_DEFAULT_MAX_IO_QUEUES;
         let msix_vectors = 1 + max_io_queues;
 
         // Create MSI-X interrupt group
@@ -422,19 +480,27 @@ impl NvmeController {
         );
 
         // Setup MSI-X capability
-        // BAR0 layout: 0x0000-0x0FFF registers, 0x1000-0x1FFF doorbells,
-        // 0x2000-0x5FFF MSI-X table, 0x6000+ PBA
-        let msix_cap = MsixCap::new(
-            0,            // table BAR indicator (BAR0)
+        // BAR0 layout: 0x0000-0x0FFF registers, 0x1000+ doorbells,
+        // 0x2000-0x2FFF MSI-X table, 0x6000+ PBA
+        let mut msix_cap = MsixCap::new(
+            0, // table BAR indicator (BAR0)
             msix_vectors,
-            0x2000,       // table offset in BAR0
-            0,            // PBA BAR indicator (BAR0)
-            0x6000,       // PBA offset in BAR0
+            MSI_X_TABLE_OFFSET as u32, // table offset in BAR0
+            0,                         // PBA BAR indicator (BAR0)
+            PBA_OFFSET as u32,         // PBA offset in BAR0
         );
+        // MSI-X must be disabled until the guest enables it through Message Control.
+        msix_cap.set_msg_ctl(0);
         let msix_cap_offset = configuration
             .add_capability(&msix_cap)
             .map_err(|e| Error::PciConfig(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         let msix_cap_reg_idx = Some((msix_cap_offset / 4) as usize);
+
+        // Add PCI Power Management capability (PMC: v1.2, D0-D3hot; PMCSR: NO_SOFT_RESET).
+        let pm_cap = PmCap::new();
+        configuration
+            .add_capability(&pm_cap)
+            .map_err(|e| Error::PciConfig(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         Ok(NvmeController {
             id,
@@ -454,6 +520,7 @@ impl NvmeController {
                 q
             },
             io_queues: vec![NvmeQueue::new(); max_io_queues as usize],
+            pending_async_event_requests: Vec::new(),
             cc_en: false,
             cc: 0,
             intms: 0,
@@ -465,6 +532,8 @@ impl NvmeController {
             namespace_uuid: Uuid::new_v4(),
             pci_device_bdf,
             max_io_queues,
+            num_io_submission_queues: max_io_queues,
+            num_io_completion_queues: max_io_queues,
             msix_vectors,
             asq_lo: 0,
             asq_hi: 0,
@@ -480,7 +549,8 @@ impl NvmeController {
     fn read_register(&self, offset: u64, data: &mut [u8]) {
         // Handle 64-bit registers that may be read as two 32-bit accesses
         if offset >= CAP_OFFSET && offset < CAP_OFFSET + 8 {
-             let cap: u64 = 0x0040_0020_0000_01FF;
+            // MQES=63, CQR=1, TO=15, DSTRD=2, CSS=NVM, and 4 KiB pages.
+            let cap: u64 = 0x0000_0022_0F01_003F;
             let cap_offset = offset - CAP_OFFSET;
             if cap_offset == 0 && data.len() >= 8 {
                 LittleEndian::write_u64(data, cap);
@@ -548,7 +618,7 @@ impl NvmeController {
         match offset {
             VS_OFFSET => {
                 if data.len() >= 4 {
-                    LittleEndian::write_u32(data, 0x1400);
+                    LittleEndian::write_u32(data, 0x0001_0400);
                 }
             }
             INTMS_OFFSET | INTMC_OFFSET => {
@@ -557,13 +627,16 @@ impl NvmeController {
                 }
             }
             CC_OFFSET => {
+                let cc_val = self.cc;
                 if data.len() >= 4 {
-                    LittleEndian::write_u32(data, self.cc);
+                    LittleEndian::write_u32(data, cc_val);
                 }
             }
             CSTS_OFFSET => {
-                // CSTS.RDY = 1 when controller is ready (cc_en && no fatal error)
-                let csts: u32 = if self.cc_en { 1 } else { 0 };
+                let ready = u32::from(self.cc_en);
+                // No asynchronous shutdown work is required, so SHN completes immediately.
+                let shutdown_status = if self.cc_en && (self.cc >> 14) & 0x3 != 0 { 0x2 << 2 } else { 0 };
+                let csts = ready | shutdown_status;
                 if data.len() >= 4 {
                     LittleEndian::write_u32(data, csts);
                 }
@@ -591,11 +664,7 @@ impl NvmeController {
 
     fn write_register(&mut self, offset: u64, data: &[u8]) {
         if data.len() >= 8 {
-            info!(
-                "NVMe write_register offset=0x{:x} data=0x{:016x}",
-                offset,
-                LittleEndian::read_u64(data)
-            );
+            info!("NVMe write_register offset=0x{:x} data=0x{:016x}", offset, LittleEndian::read_u64(data));
         } else {
             info!(
                 "NVMe write_register offset=0x{:x} data=0x{:08x}",
@@ -626,7 +695,7 @@ impl NvmeController {
 
                 if new_en != self.cc_en {
                     if new_en {
-                        info!("NVMe controller enabled");
+                        info!("NVMe controller enabled CC=0x{:08x}", cc);
                     } else {
                         info!("NVMe controller disabled, resetting queues");
                         self.admin_queue.sq_head = 0;
@@ -634,6 +703,9 @@ impl NvmeController {
                         self.admin_queue.cq_tail = 0;
                         self.admin_queue.cq_count = 0;
                         self.admin_queue.cq_phase = true;
+                        self.pending_async_event_requests.clear();
+                        self.num_io_submission_queues = self.max_io_queues;
+                        self.num_io_completion_queues = self.max_io_queues;
                         for queue in self.io_queues.iter_mut() {
                             *queue = NvmeQueue::new();
                         }
@@ -767,13 +839,20 @@ impl NvmeController {
             return;
         };
 
-        info!("NVMe process_sq_doorbell sqid={} allocated={} sq_addr={:?} cq_addr={:?}", sqid, queue.allocated, queue.sq_addr, queue.cq_addr);
+        info!(
+            "NVMe process_sq_doorbell sqid={} allocated={} sq_addr={:?} cq_addr={:?}",
+            sqid, queue.allocated, queue.sq_addr, queue.cq_addr
+        );
         if sqid == 0 {
             if queue.sq_addr.is_none() || queue.cq_addr.is_none() || queue.queue_size == 0 {
                 info!("NVMe admin queue not ready");
                 return;
             }
         } else if !queue.allocated {
+            return;
+        }
+        if new_tail >= queue.queue_size {
+            warn!("Invalid SQ{} doorbell tail {}", sqid, new_tail);
             return;
         }
 
@@ -792,13 +871,18 @@ impl NvmeController {
             return;
         }
 
-        let _queue = if cqid == 0 {
+        let queue = if cqid == 0 {
             &mut self.admin_queue
         } else if cqid <= self.max_io_queues {
             &mut self.io_queues[cqid as usize - 1]
         } else {
             return;
         };
+
+        if queue.queue_size == 0 || new_head >= queue.queue_size {
+            warn!("Invalid CQ{} doorbell head {}", cqid, new_head);
+            return;
+        }
 
         info!("CQ{} doorbell: head={}", cqid, new_head);
     }
@@ -808,7 +892,10 @@ impl NvmeController {
     // -----------------------------------------------------------------------
 
     fn process_admin_queue(&mut self) {
-        info!("NVMe process_admin_queue sq_addr={:?} cq_addr={:?}", self.admin_queue.sq_addr, self.admin_queue.cq_addr);
+        info!(
+            "NVMe process_admin_queue sq_addr={:?} cq_addr={:?}",
+            self.admin_queue.sq_addr, self.admin_queue.cq_addr
+        );
         let sq_addr = self.admin_queue.sq_addr;
         let cq_addr = self.admin_queue.cq_addr;
         if sq_addr.is_none() || cq_addr.is_none() {
@@ -830,35 +917,59 @@ impl NvmeController {
 
             let sqe = parse_sqe(&sqe_bytes);
             info!("NVMe admin SQE bytes[0..64]: {:02x?}", &sqe_bytes);
-            info!("NVMe admin command: opcode=0x{:02x}, CID={}, NSID={}, CDW10=0x{:08x}", sqe.opcode(), sqe.command_id(), sqe.nsid, sqe.cdw10);
+            info!(
+                "NVMe admin command: opcode=0x{:02x}, CID={}, NSID={}, CDW10=0x{:08x}",
+                sqe.opcode(),
+                sqe.command_id(),
+                sqe.nsid,
+                sqe.cdw10
+            );
 
-            let (status, result) = self.handle_admin_command(&sqe);
-            info!("NVMe admin completion: CID={}, status=0x{:04x}, result=0x{:08x}", sqe.command_id(), status, result);
+            let completion = if sqe.opcode() == NVME_ADMIN_ASYNC_EVENT_REQ {
+                if self.pending_async_event_requests.contains(&sqe.command_id()) {
+                    Some((NVME_SC_CMD_ID_CONFLICT, 0))
+                } else if self.pending_async_event_requests.len() < NVME_MAX_ASYNC_EVENT_REQUESTS {
+                    self.pending_async_event_requests.push(sqe.command_id());
+                    info!(
+                        "NVMe async event request pending: CID={}, outstanding={}",
+                        sqe.command_id(),
+                        self.pending_async_event_requests.len()
+                    );
+                    None
+                } else {
+                    Some(self.admin_async_event_request(&sqe))
+                }
+            } else {
+                Some(self.handle_admin_command(&sqe))
+            };
 
             // Advance SQ head
             self.admin_queue.sq_head = (self.admin_queue.sq_head + 1) % self.admin_queue.queue_size;
 
-            // Enqueue completion
-            self.enqueue_completion(
-                0,
-                sqe.command_id(),
-                status,
-                0,
-                result,
-            );
+            if let Some((status, result)) = completion {
+                info!(
+                    "NVMe admin completion: CID={}, status=0x{:04x}, result=0x{:08x}",
+                    sqe.command_id(),
+                    status,
+                    result
+                );
+                self.enqueue_completion(0, sqe.command_id(), status, 0, result);
+            }
         }
     }
 
     fn process_io_queue(&mut self, sqid: u16) {
         let idx = sqid as usize - 1;
         let sq_addr = self.io_queues[idx].sq_addr;
-        let cq_addr = self.io_queues[idx].cq_addr;
+        let cqid = self.io_queues[idx].cqid;
+        let cq_addr = if cqid > 0 && cqid <= self.max_io_queues {
+            self.io_queues[cqid as usize - 1].cq_addr
+        } else {
+            None
+        };
         info!(
             "NVMe process_io_queue sqid={} sq_addr={:?} cq_addr={:?} allocated={}",
-            sqid,
-            sq_addr,
-            cq_addr,
-            self.io_queues[idx].allocated
+            sqid, sq_addr, cq_addr, self.io_queues[idx].allocated
         );
         if sq_addr.is_none() || cq_addr.is_none() {
             return;
@@ -877,29 +988,22 @@ impl NvmeController {
             }
 
             let sqe = parse_sqe(&sqe_bytes);
-        info!(
-            "I/O command: SQ={}, opcode=0x{:02x}, CID={}, NSID={}, flags=0x{:02x}",
-            sqid,
-            sqe.opcode(),
-            sqe.command_id(),
-            sqe.nsid,
-            sqe.flags()
-        );
+            info!(
+                "I/O command: SQ={}, opcode=0x{:02x}, CID={}, NSID={}, flags=0x{:02x}",
+                sqid,
+                sqe.opcode(),
+                sqe.command_id(),
+                sqe.nsid,
+                sqe.flags()
+            );
 
             let (status, result) = self.handle_io_command(&sqe);
 
             // Advance SQ head
-            self.io_queues[idx].sq_head =
-                (self.io_queues[idx].sq_head + 1) % self.io_queues[idx].queue_size;
+            self.io_queues[idx].sq_head = (self.io_queues[idx].sq_head + 1) % self.io_queues[idx].queue_size;
 
             // Enqueue completion
-            self.enqueue_completion(
-                sqid,
-                sqe.command_id(),
-                status,
-                sqid,
-                result,
-            );
+            self.enqueue_completion(cqid, sqe.command_id(), status, sqid, result);
         }
     }
 
@@ -911,6 +1015,7 @@ impl NvmeController {
         match sqe.opcode() {
             NVME_ADMIN_DELETE_SQ => self.admin_delete_sq(sqe),
             NVME_ADMIN_CREATE_SQ => self.admin_create_sq(sqe),
+            NVME_ADMIN_DELETE_CQ => self.admin_delete_cq(sqe),
             NVME_ADMIN_CREATE_CQ => self.admin_create_cq(sqe),
             NVME_ADMIN_GET_LOG_PAGE => self.admin_get_log_page(sqe),
             NVME_ADMIN_IDENTIFY => self.admin_identify(sqe),
@@ -926,15 +1031,35 @@ impl NvmeController {
     }
 
     fn admin_delete_sq(&mut self, sqe: &NvmeSqe) -> (u16, u32) {
-        let sqid = sqe.command_id();
+        let sqid = (sqe.cdw10 & 0xffff) as u16;
         if sqid == 0 || sqid > self.max_io_queues {
             return (NVME_SC_INVALID_FIELD, 0);
         }
         if !self.io_queues[sqid as usize - 1].allocated {
             return (NVME_SC_INVALID_FIELD, 0);
         }
-        self.io_queues[sqid as usize - 1] = NvmeQueue::new();
+        let queue = &mut self.io_queues[sqid as usize - 1];
+        queue.sq_addr = None;
+        queue.sq_head = 0;
+        queue.sq_tail = 0;
+        queue.cqid = 0;
+        queue.allocated = false;
         info!("Deleted SQ {}", sqid);
+        (NVME_SC_SUCCESS, 0)
+    }
+
+    fn admin_delete_cq(&mut self, sqe: &NvmeSqe) -> (u16, u32) {
+        let cqid = (sqe.cdw10 & 0xffff) as u16;
+        if cqid == 0 || cqid > self.max_io_queues {
+            return (NVME_SC_INVALID_FIELD, 0);
+        }
+
+        if self.io_queues[cqid as usize - 1].cq_addr.is_none() || self.io_queues.iter().any(|queue| queue.allocated && queue.cqid == cqid) {
+            return (NVME_SC_INVALID_FIELD, 0);
+        }
+        let queue = &mut self.io_queues[cqid as usize - 1];
+        *queue = NvmeQueue::new();
+        info!("Deleted CQ {}", cqid);
         (NVME_SC_SUCCESS, 0)
     }
 
@@ -944,12 +1069,9 @@ impl NvmeController {
         let pc = sqe.cdw11 & 0x1;
         let cqid = (sqe.cdw11 >> 16) as u16;
 
-        info!(
-            "NVMe Create SQ: SQID={} QSIZE={} PC={} CQID={}",
-            sqid, qsize, pc, cqid
-        );
+        info!("NVMe Create SQ: SQID={} QSIZE={} PC={} CQID={}", sqid, qsize, pc, cqid);
 
-        if sqid == 0 || sqid > self.max_io_queues {
+        if sqid == 0 || sqid > self.num_io_submission_queues || qsize > 0x3f || pc == 0 {
             info!("NVMe Create SQ rejected: SQID out of range");
             return (NVME_SC_INVALID_FIELD, 0);
         }
@@ -958,48 +1080,40 @@ impl NvmeController {
             return (NVME_SC_INVALID_FIELD, 0);
         }
 
-        // For simplicity, require CQ ID == SQ ID
-        if cqid != sqid {
-            info!(
-                "NVMe Create SQ rejected: CQID {} != SQID {}",
-                cqid, sqid
-            );
+        if cqid == 0 || cqid > self.num_io_completion_queues || self.io_queues[cqid as usize - 1].cq_addr.is_none() {
+            info!("NVMe Create SQ rejected: invalid CQID {}", cqid);
             return (NVME_SC_INVALID_FIELD, 0);
         }
 
         let queue = &mut self.io_queues[sqid as usize - 1];
         queue.sq_addr = Some(GuestAddress(sqe.prp1()));
         queue.queue_size = qsize + 1;
+        queue.cqid = cqid;
         queue.allocated = true;
 
-        info!(
-            "NVMe Created SQ {} -> CQ {}, size={}, PC={}",
-            sqid,
-            cqid,
-            qsize + 1,
-            pc
-        );
+        info!("NVMe Created SQ {} -> CQ {}, size={}, PC={}", sqid, cqid, qsize + 1, pc);
         (NVME_SC_SUCCESS, 0)
     }
 
     fn admin_create_cq(&mut self, sqe: &NvmeSqe) -> (u16, u32) {
         let cqid = (sqe.cdw10 & 0xFFFF) as u16;
-        let qsize = ((sqe.cdw10 >> 16) as u16) + 1;
+        let qsize = ((sqe.cdw10 >> 16) & 0xffff) as u16;
         let pc = sqe.cdw11 & 0x1;
+        let interrupt_enabled = sqe.cdw11 & 0x2 != 0;
         let vector = (sqe.cdw11 >> 16) as u16;
 
-        if cqid == 0 || cqid > self.max_io_queues {
+        if cqid == 0 || cqid > self.num_io_completion_queues || qsize > 0x3f || pc == 0 || (interrupt_enabled && vector >= self.msix_vectors) {
             return (NVME_SC_INVALID_FIELD, 0);
         }
 
         let queue = &mut self.io_queues[cqid as usize - 1];
         queue.cq_addr = Some(GuestAddress(sqe.prp1()));
-        queue.queue_size = qsize;
-        /* Start controller phase matching guest's PC so first CQEs are recognized. */
-        queue.cq_phase = pc != 0;
+        queue.queue_size = qsize + 1;
+        queue.cq_phase = true;
         queue.vector = vector;
+        queue.interrupt_enabled = interrupt_enabled;
 
-        info!("NVMe Created CQ {}, size={}, PC={}, vector={}", cqid, qsize, pc, vector);
+        info!("NVMe Created CQ {}, size={}, PC={}, vector={}", cqid, qsize + 1, pc, vector);
         (NVME_SC_SUCCESS, 0)
     }
 
@@ -1014,12 +1128,20 @@ impl NvmeController {
 
         let cns = (sqe.cdw10 & 0xFF) as u8;
         let nsid = if sqe.nsid == 0 { 1 } else { sqe.nsid };
-        info!("NVMe Identify: CNS=0x{:02x}, NSID={}, PRP1=0x{:x}, PRP2=0x{:x}", cns, nsid, sqe.prp1(), sqe.prp2());
+        info!(
+            "NVMe Identify: CNS=0x{:02x}, NSID={}, PRP1=0x{:x}, PRP2=0x{:x}",
+            cns,
+            nsid,
+            sqe.prp1(),
+            sqe.prp2()
+        );
         let mut data = [0u8; 4096];
 
         match cns {
             0x00 => {
-                // Identify Namespace or Namespace Type - NSID=0 means only namespace
+                if nsid != 1 {
+                    return (NVME_SC_INVALID_NS, 0);
+                }
                 self.fill_identify_namespace(&mut data);
             }
             0x01 => {
@@ -1027,19 +1149,19 @@ impl NvmeController {
                 self.fill_identify_controller(&mut data);
             }
             0x02 => {
-                // Identify Namespace by NSID
+                // Active Namespace ID list, starting after the requested NSID.
+                if sqe.nsid < 1 {
+                    LittleEndian::write_u32(&mut data[0..4], 1);
+                }
+            }
+            0x03 => {
                 if nsid != 1 {
                     return (NVME_SC_INVALID_NS, 0);
                 }
-                self.fill_identify_namespace(&mut data);
-            }
-            0x03 => {
-                // Identify Namespace List - return list with NSID=1
-                data[0] = 1;
-            }
-            0x04 => {
-                // Identify Namespace Type
-                self.fill_identify_namespace(&mut data);
+                // Namespace Identification Descriptor: UUID.
+                data[0] = 0x03;
+                data[1] = 16;
+                data[4..20].copy_from_slice(self.namespace_uuid.as_bytes());
             }
             _ => {
                 warn!("Unsupported Identify CNS 0x{:02x}", cns);
@@ -1095,28 +1217,28 @@ impl NvmeController {
         data[0x04E] = 1;
 
         // Offset 0x050: Version
-        LittleEndian::write_u32(&mut data[0x050..0x054], 0x14);
+        LittleEndian::write_u32(&mut data[0x050..0x054], 0x0001_0400);
 
         // Offset 0x100: Optional Admin Command Support
-        LittleEndian::write_u16(&mut data[0x100..0x102], 0x7);
+        LittleEndian::write_u16(&mut data[0x100..0x102], 0);
 
-        // Offset 0x102: Autonomous Power State Transition
-        data[0x102] = 3;
+        // Offset 0x102: Abort Command Limit (zero-based)
+        data[0x102] = 0;
 
         // Offset 0x103: Async Event Request Limit
-        data[0x103] = 8;
+        data[0x103] = NVME_AERL;
 
         // Offset 0x104: Firmware updates
-        data[0x104] = 7;
+        data[0x104] = 0;
 
         // Offset 0x105: Log Page Attributes
-        data[0x105] = 0x1;
+        data[0x105] = 0;
 
         // Offset 0x106: Error Log Page Entries
-        data[0x106] = 8;
+        data[0x106] = 0;
 
         // Offset 0x107: Number of Power State Support Structures
-        data[0x107] = 1;
+        data[0x107] = 0;
 
         // Offset 0x118: Total NVM Capacity (16 bytes, in bytes)
         LittleEndian::write_u64(&mut data[0x118..0x120], self.namespace_capacity * LBA_SIZE);
@@ -1128,7 +1250,7 @@ impl NvmeController {
         data[0x200] = 0x66;
 
         // Offset 0x201: CQ Entry Size - min=16B(2), max=16B(2)
-        data[0x201] = 0x22;
+        data[0x201] = 0x44;
 
         // Offset 0x202: Maximum Outstanding Commands
         LittleEndian::write_u16(&mut data[0x202..0x204], 65535);
@@ -1137,13 +1259,13 @@ impl NvmeController {
         LittleEndian::write_u32(&mut data[0x204..0x208], self.num_namespaces);
 
         // Offset 0x208: Optional NVM Command Support
-        LittleEndian::write_u16(&mut data[0x208..0x20A], 0x3);
+        LittleEndian::write_u16(&mut data[0x208..0x20A], 0);
 
         // Offset 0x20A: Fused Operation Support
-        LittleEndian::write_u16(&mut data[0x20A..0x20C], 0x3);
+        LittleEndian::write_u16(&mut data[0x20A..0x20C], 0);
 
-        // Offset 0x210: Volatile Write Cache
-        data[0x210] = 1;
+        // Offset 0x20D: Volatile Write Cache
+        data[0x20D] = 1;
     }
 
     fn fill_identify_namespace(&self, data: &mut [u8; 4096]) {
@@ -1179,23 +1301,50 @@ impl NvmeController {
     fn admin_get_features(&mut self, sqe: &NvmeSqe) -> (u16, u32) {
         let feat_id = (sqe.cdw10 & 0xFF) as u8;
         info!("Get features: feat_id={}", feat_id);
-        (NVME_SC_SUCCESS, 0)
+        if feat_id == NVME_FEAT_NUM_QUEUES {
+            let result = u32::from(self.num_io_submission_queues - 1) | (u32::from(self.num_io_completion_queues - 1) << 16);
+            (NVME_SC_SUCCESS, result)
+        } else {
+            (NVME_SC_SUCCESS, 0)
+        }
     }
 
     fn admin_set_features(&mut self, sqe: &NvmeSqe) -> (u16, u32) {
         let feat_id = (sqe.cdw10 & 0xFF) as u8;
         info!("Set features: feat_id={}", feat_id);
-        (NVME_SC_SUCCESS, 0)
+        if feat_id == NVME_FEAT_NUM_QUEUES {
+            if self.io_queues.iter().any(|queue| queue.cq_addr.is_some()) {
+                return (NVME_SC_INVALID_FIELD, 0);
+            }
+
+            let requested_sq = (sqe.cdw11 & 0xffff) + 1;
+            let requested_cq = (sqe.cdw11 >> 16) + 1;
+            self.num_io_submission_queues = requested_sq.min(u32::from(self.max_io_queues)) as u16;
+            self.num_io_completion_queues = requested_cq.min(u32::from(self.max_io_queues)) as u16;
+            let result = u32::from(self.num_io_submission_queues - 1) | (u32::from(self.num_io_completion_queues - 1) << 16);
+            (NVME_SC_SUCCESS, result)
+        } else {
+            (NVME_SC_SUCCESS, 0)
+        }
     }
 
-    fn admin_abort(&mut self, _sqe: &NvmeSqe) -> (u16, u32) {
-        info!("Abort command");
-        (NVME_SC_SUCCESS, 0)
+    fn admin_abort(&mut self, sqe: &NvmeSqe) -> (u16, u32) {
+        let sqid = (sqe.cdw10 & 0xffff) as u16;
+        let cid = (sqe.cdw10 >> 16) as u16;
+        if sqid == 0
+            && let Some(index) = self.pending_async_event_requests.iter().position(|pending_cid| *pending_cid == cid)
+        {
+            self.pending_async_event_requests.remove(index);
+            self.enqueue_completion(0, cid, NVME_SC_ABORT_REQ, 0, 0);
+            return (NVME_SC_SUCCESS, 0);
+        }
+
+        (NVME_SC_SUCCESS, 1)
     }
 
     fn admin_async_event_request(&mut self, _sqe: &NvmeSqe) -> (u16, u32) {
-        info!("Async event request");
-        (NVME_SC_SUCCESS, 0)
+        warn!("Async event request limit exceeded");
+        (NVME_SC_ASYNC_EVT_REQ_LIMIT, 0)
     }
 
     // -----------------------------------------------------------------------
@@ -1246,7 +1395,14 @@ impl NvmeController {
         let slba = sqe.cdw10 as u64 | ((sqe.cdw11 as u64) << 32);
         let length = (sqe.cdw12 & 0xFFFF) as u32 + 1;
         let nsid = if sqe.nsid == 0 { 1 } else { sqe.nsid };
-        info!("Read: NSID={} SLBA={} length={} PRP1=0x{:x} PRP2=0x{:x}", nsid, slba, length, sqe.prp1(), sqe.prp2());
+        info!(
+            "Read: NSID={} SLBA={} length={} PRP1=0x{:x} PRP2=0x{:x}",
+            nsid,
+            slba,
+            length,
+            sqe.prp1(),
+            sqe.prp2()
+        );
 
         if nsid != 1 {
             return (NVME_SC_INVALID_NS, 0);
@@ -1280,7 +1436,12 @@ impl NvmeController {
                 let _ = self.write_prp(sqe.prp1(), sqe.prp2(), &data[..cap as usize]);
             }
         }
-        info!("Read SLBA={} wrote {} bytes, first 16: {:02x?}", slba, data.len(), &data[..std::cmp::min(16, data.len())]);
+        info!(
+            "Read SLBA={} wrote {} bytes, first 16: {:02x?}",
+            slba,
+            data.len(),
+            &data[..std::cmp::min(16, data.len())]
+        );
 
         (NVME_SC_SUCCESS, 0)
     }
@@ -1347,9 +1508,7 @@ impl NvmeController {
 
         if to_copy > 0 {
             let mut page_buf = vec![0u8; to_copy as usize];
-            guest_mem
-                .read(&mut page_buf[..], GuestAddress(prp1))
-                .map_err(Error::GuestMemory)?;
+            guest_mem.read(&mut page_buf[..], GuestAddress(prp1)).map_err(Error::GuestMemory)?;
             buf[..to_copy as usize].copy_from_slice(&page_buf);
             offset += to_copy as usize;
         }
@@ -1369,9 +1528,7 @@ impl NvmeController {
                 }
                 if remaining > 0 {
                     let mut page_buf = vec![0u8; remaining];
-                    guest_mem
-                        .read(&mut page_buf[..], GuestAddress(next_page))
-                        .map_err(Error::GuestMemory)?;
+                    guest_mem.read(&mut page_buf[..], GuestAddress(next_page)).map_err(Error::GuestMemory)?;
                     buf[offset..].copy_from_slice(&page_buf);
                 }
                 return Ok(());
@@ -1386,9 +1543,7 @@ impl NvmeController {
             // PRP2 is a direct second page
             if remaining_after_prp1 > 0 {
                 let mut page_buf = vec![0u8; remaining_after_prp1];
-                guest_mem
-                    .read(&mut page_buf[..], GuestAddress(prp2))
-                    .map_err(Error::GuestMemory)?;
+                guest_mem.read(&mut page_buf[..], GuestAddress(prp2)).map_err(Error::GuestMemory)?;
                 buf[offset..].copy_from_slice(&page_buf);
             }
         } else {
@@ -1398,9 +1553,7 @@ impl NvmeController {
 
             while remaining > 0 {
                 let mut prp_entry_bytes = [0u8; 8];
-                guest_mem
-                    .read(&mut prp_entry_bytes, GuestAddress(prp_list_addr))
-                    .map_err(Error::GuestMemory)?;
+                guest_mem.read(&mut prp_entry_bytes, GuestAddress(prp_list_addr)).map_err(Error::GuestMemory)?;
                 let prp_entry = LittleEndian::read_u64(&prp_entry_bytes);
 
                 if prp_entry == 0 {
@@ -1409,9 +1562,7 @@ impl NvmeController {
 
                 let page_size = std::cmp::min(remaining as u64, NVME_PAGE_SIZE);
                 let mut page_buf = vec![0u8; page_size as usize];
-                guest_mem
-                    .read(&mut page_buf[..], GuestAddress(prp_entry))
-                    .map_err(Error::GuestMemory)?;
+                guest_mem.read(&mut page_buf[..], GuestAddress(prp_entry)).map_err(Error::GuestMemory)?;
                 buf[offset..offset + page_size as usize].copy_from_slice(&page_buf);
                 offset += page_size as usize;
                 remaining -= page_size as usize;
@@ -1457,9 +1608,7 @@ impl NvmeController {
         let to_copy = std::cmp::min(buf.len() as u64, prp1_remaining);
 
         if to_copy > 0 {
-            guest_mem
-                .write(&buf[..to_copy as usize], GuestAddress(prp1))
-                .map_err(Error::GuestMemory)?;
+            guest_mem.write(&buf[..to_copy as usize], GuestAddress(prp1)).map_err(Error::GuestMemory)?;
             offset += to_copy as usize;
         }
 
@@ -1476,9 +1625,7 @@ impl NvmeController {
                 if remaining as u64 > NVME_PAGE_SIZE {
                     return Err(Error::InvalidPrpList);
                 }
-                guest_mem
-                    .write(&buf[offset..], GuestAddress(next_page))
-                    .map_err(Error::GuestMemory)?;
+                guest_mem.write(&buf[offset..], GuestAddress(next_page)).map_err(Error::GuestMemory)?;
                 return Ok(());
             }
             return Err(Error::InvalidPrpList);
@@ -1490,9 +1637,7 @@ impl NvmeController {
         if remaining_after_prp1 as u64 <= NVME_PAGE_SIZE {
             // PRP2 is a direct second page
             if remaining_after_prp1 > 0 {
-                guest_mem
-                    .write(&buf[offset..], GuestAddress(prp2))
-                    .map_err(Error::GuestMemory)?;
+                guest_mem.write(&buf[offset..], GuestAddress(prp2)).map_err(Error::GuestMemory)?;
             }
         } else {
             // PRP2 is a PRP list pointer
@@ -1501,9 +1646,7 @@ impl NvmeController {
 
             while remaining > 0 {
                 let mut prp_entry_bytes = [0u8; 8];
-                guest_mem
-                    .read(&mut prp_entry_bytes, GuestAddress(prp_list_addr))
-                    .map_err(Error::GuestMemory)?;
+                guest_mem.read(&mut prp_entry_bytes, GuestAddress(prp_list_addr)).map_err(Error::GuestMemory)?;
                 let prp_entry = LittleEndian::read_u64(&prp_entry_bytes);
 
                 if prp_entry == 0 {
@@ -1529,11 +1672,7 @@ impl NvmeController {
     // -----------------------------------------------------------------------
 
     fn enqueue_completion(&mut self, cqid: u16, cid: u16, status: u16, sq_id: u16, result: u32) {
-        let queue = if cqid == 0 {
-            &self.admin_queue
-        } else {
-            &self.io_queues[cqid as usize - 1]
-        };
+        let queue = if cqid == 0 { &self.admin_queue } else { &self.io_queues[cqid as usize - 1] };
 
         if queue.cq_addr.is_none() {
             return;
@@ -1558,18 +1697,23 @@ impl NvmeController {
         };
 
         let cqe_addr = GuestAddress(cq_addr.0 + cq_offset);
-        info!("NVMe enqueue_completion cqid={} cid={} status=0x{:04x} cq_addr=0x{:x} offset={} cqe_addr=0x{:x} phase={}", cqid, cid, status, cq_addr.raw_value(), cq_offset, cqe_addr.raw_value(), phase);
+        info!(
+            "NVMe enqueue_completion cqid={} cid={} status=0x{:04x} cq_addr=0x{:x} offset={} cqe_addr=0x{:x} phase={}",
+            cqid,
+            cid,
+            status,
+            cq_addr.raw_value(),
+            cq_offset,
+            cqe_addr.raw_value(),
+            phase
+        );
 
         let cqe = NvmeCqe::new(cid, phase, status, sq_id, 0, result);
         let mut cqe_bytes = [0u8; 16];
         // SAFETY: NvmeCqe is a simple struct with no padding issues, and we're
         // copying exactly 16 bytes which matches the struct size.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                &cqe as *const NvmeCqe as *const u8,
-                cqe_bytes.as_mut_ptr(),
-                16,
-            );
+            std::ptr::copy_nonoverlapping(&cqe as *const NvmeCqe as *const u8, cqe_bytes.as_mut_ptr(), 16);
         }
         info!("NVMe CQE bytes: {:02x?}", &cqe_bytes);
 
@@ -1597,21 +1741,30 @@ impl NvmeController {
             }
         }
 
-        // Trigger MSI-X interrupt if not masked
-        // Linux uses Linux IRQ subsystem for masking (disable_irq/enable_irq),
-        // which maps to MSI-X table entry mask bit. No INTMS/INTMC check needed.
-        let vector = if cqid == 0 { 0 } else { self.io_queues[cqid as usize - 1].vector };
-        let msix = self.msix_config.lock().unwrap();
-        let interrupt_masked = msix.masked()
-            || msix.table_entries[vector as usize].masked();
+        let (vector, interrupt_enabled) = if cqid == 0 {
+            (0, true)
+        } else {
+            let queue = &self.io_queues[cqid as usize - 1];
+            (queue.vector, queue.interrupt_enabled)
+        };
+        if !interrupt_enabled {
+            return;
+        }
+
+        let mut msix = self.msix_config.lock().unwrap();
+        if !msix.enabled() {
+            return;
+        }
+        if msix.masked() || msix.table_entries[vector as usize].masked() {
+            msix.set_pba_bit(vector, false);
+            return;
+        }
         drop(msix);
 
-        if !interrupt_masked {
-            if let Some(ref group) = self.interrupt_group {
-                if let Err(e) = group.trigger(vector as InterruptIndex) {
-                    error!("Failed to trigger MSI-X interrupt: {}", e);
-                }
-            }
+        if let Some(ref group) = self.interrupt_group
+            && let Err(e) = group.trigger(vector as InterruptIndex)
+        {
+            error!("Failed to trigger MSI-X interrupt: {}", e);
         }
     }
 }
@@ -1654,14 +1807,14 @@ impl NvmeSqe {
 // ---------------------------------------------------------------------------
 
 impl BusDevice for NvmeController {
-    fn read(&mut self, base: u64, offset: u64, data: &mut [u8]) {
+    fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
         if offset < DBL_BASE_OFFSET {
             self.read_register(offset, data);
         } else {
             let tbl_offset = self.msix_cap.table_offset() as u64;
             let tbl_size = self.msix_cap.table_size() as u64 * 16;
             let pba_offset = self.msix_cap.pba_offset() as u64;
-            let pba_size = ((self.msix_cap.table_size() as u64 / 64) + 1) * 8;
+            let pba_size = self.msix_cap.table_size().div_ceil(64) as u64 * 8;
 
             if tbl_offset <= offset && offset < tbl_offset + tbl_size {
                 let table_offset = offset - tbl_offset;
@@ -1669,6 +1822,9 @@ impl BusDevice for NvmeController {
             } else if pba_offset <= offset && offset < pba_offset + pba_size {
                 let pba_offset_rel = offset - pba_offset;
                 self.msix_config.lock().unwrap().read_pba(pba_offset_rel, data);
+            } else if offset >= DBL_BASE_OFFSET {
+                // Doorbell read: return 0 (doorbells are write-only per spec)
+                data.fill(0);
             } else {
                 warn!("Unexpected BAR0 read at offset 0x{:x}", offset);
                 data.fill(0);
@@ -1676,15 +1832,14 @@ impl BusDevice for NvmeController {
         }
     }
 
-    fn write(&mut self, base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
-        info!("NVMe BAR write offset=0x{:x} len={} val=0x{:08x}", offset, data.len(), if data.len() >= 4 { LittleEndian::read_u32(data) } else { 0u32 });
+    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
         if offset < DBL_BASE_OFFSET {
             self.write_register(offset, data);
         } else {
             let tbl_offset = self.msix_cap.table_offset() as u64;
             let tbl_size = self.msix_cap.table_size() as u64 * 16;
             let pba_offset = self.msix_cap.pba_offset() as u64;
-            let pba_size = ((self.msix_cap.table_size() as u64 / 64) + 1) * 8;
+            let pba_size = self.msix_cap.table_size().div_ceil(64) as u64 * 8;
 
             if tbl_offset <= offset && offset < tbl_offset + tbl_size {
                 let table_offset = offset - tbl_offset;
@@ -1693,17 +1848,28 @@ impl BusDevice for NvmeController {
                 let pba_offset_rel = offset - pba_offset;
                 self.msix_config.lock().unwrap().write_pba(pba_offset_rel, data);
             } else if offset >= DBL_BASE_OFFSET {
+                // Interleaved doorbells:
+                // SQ[N] at base + (2*N) * DBL_STRIDE
+                // CQ[N] at base + (2*N+1) * DBL_STRIDE
                 let db_offset = offset - DBL_BASE_OFFSET;
-                let sqid = (db_offset / DBL_STRIDE) as u16;
-                let new_value = if data.len() >= 2 {
-                    LittleEndian::read_u16(data)
-                } else {
-                    let mut aligned = [0u8; 2];
-                    aligned[..data.len()].copy_from_slice(data);
-                    LittleEndian::read_u16(&aligned)
-                };
+                if data.len() != 4 || db_offset % DBL_STRIDE != 0 {
+                    warn!("Invalid NVMe doorbell write at 0x{:x}", offset);
+                    return None;
+                }
+                let dbl_idx = (db_offset / DBL_STRIDE) as u16;
+                if dbl_idx >= (self.max_io_queues + 1) * 2 {
+                    warn!("Invalid NVMe doorbell index {}", dbl_idx);
+                    return None;
+                }
+                let sqid = dbl_idx / 2;
+                let new_value = LittleEndian::read_u32(data);
+                if new_value > u32::from(u16::MAX) {
+                    warn!("Invalid NVMe doorbell value {}", new_value);
+                    return None;
+                }
+                let new_value = new_value as u16;
 
-                if (db_offset % DBL_STRIDE) < 4 {
+                if dbl_idx % 2 == 0 {
                     info!("NVMe SQ{} doorbell tail={}", sqid, new_value);
                     self.process_sq_doorbell(sqid, new_value);
                 } else {
@@ -1762,12 +1928,7 @@ impl PciDevice for NvmeController {
         Ok(())
     }
 
-    fn write_config_register(
-        &mut self,
-        reg_idx: usize,
-        offset: u64,
-        data: &[u8],
-    ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
+    fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
         let bar_reprogramming = self.configuration.write_config_register(reg_idx, offset, data);
 
         // Forward MSI-X capability writes to our MsixCap
@@ -1779,16 +1940,6 @@ impl PciDevice for NvmeController {
                     self.msix_cap.set_msg_ctl(LittleEndian::read_u16(data));
                 } else if offset == 0 && data.len() == 4 {
                     self.msix_cap.set_msg_ctl((LittleEndian::read_u32(data) >> 16) as u16);
-                }
-            } else if reg_idx == msix_reg_idx + 1 {
-                // Second dword of MSI-X capability (bytes 4-7) = Table Offset
-                if offset == 0 && data.len() == 4 {
-                    self.msix_cap.table = LittleEndian::read_u32(data);
-                }
-            } else if reg_idx == msix_reg_idx + 2 {
-                // Third dword of MSI-X capability (bytes 8-11) = PBA Offset
-                if offset == 0 && data.len() == 4 {
-                    self.msix_cap.pba = LittleEndian::read_u32(data);
                 }
             }
         }
