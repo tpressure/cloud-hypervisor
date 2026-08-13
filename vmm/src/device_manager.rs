@@ -1846,7 +1846,6 @@ impl DeviceManager {
                 .name("ch-vnc-bridge".to_string())
                 .spawn(move || {
                     let mut mouse_buttons = 0u8;
-                    let mut last_pointer_position = None;
                     for event in input_receiver.iter() {
                         match event {
                             display::vnc::VncInputEvent::Keyboard { key, down } => {
@@ -1898,44 +1897,7 @@ impl DeviceManager {
                                 }
                             }
                             display::vnc::VncInputEvent::PointerMove { dx, dy } => {
-                                forward_vnc_mouse_event(
-                                    &i8042,
-                                    &mouse_irq,
-                                    mouse_buttons,
-                                    dx,
-                                    dy,
-                                );
-                            }
-                            display::vnc::VncInputEvent::PointerPosition { x, y } => {
-                                if let Some((previous_x, previous_y)) = last_pointer_position {
-                                    let dx = i16::try_from(x as i64 - previous_x as i64)
-                                        .unwrap_or_else(|_| {
-                                            if x > previous_x {
-                                                i16::MAX
-                                            } else {
-                                                i16::MIN
-                                            }
-                                        });
-                                    // VNC uses a downward-positive Y axis, while PS/2 uses upward-positive.
-                                    let dy = i16::try_from(previous_y as i64 - y as i64)
-                                        .unwrap_or_else(|_| {
-                                            if y < previous_y {
-                                                i16::MAX
-                                            } else {
-                                                i16::MIN
-                                            }
-                                        });
-                                    if dx != 0 || dy != 0 {
-                                        forward_vnc_mouse_event(
-                                            &i8042,
-                                            &mouse_irq,
-                                            mouse_buttons,
-                                            dx,
-                                            dy,
-                                        );
-                                    }
-                                }
-                                last_pointer_position = Some((x, y));
+                                forward_vnc_mouse_event(&i8042, &mouse_irq, mouse_buttons, dx, dy);
                             }
                         }
                     }

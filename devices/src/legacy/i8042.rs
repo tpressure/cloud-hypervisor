@@ -391,6 +391,13 @@ impl KeyboardMap {
 /// This device handles PS/2 protocol commands, keyboard scan code generation,
 /// and mouse packet generation. Input events are received via `input_channel`
 /// and forwarded to the guest through the PS/2 data port.
+struct PendingMouseEvent {
+    buttons: u8,
+    buttons_dirty: bool,
+    dx: i32,
+    dy: i32,
+}
+
 pub struct I8042Device {
     reset_evt: EventFd,
     vcpus_kill_signalled: Arc<AtomicBool>,
@@ -436,6 +443,8 @@ pub struct I8042Device {
     mouse_resolution: u8,
     mouse_sample_rate: u8,
     mouse_scaling_21: bool,
+    mouse_buttons: u8,
+    pending_mouse_events: VecDeque<PendingMouseEvent>,
 
     // Pending command that needs data from input buffer
     pending_command: Option<u8>,
@@ -487,6 +496,8 @@ impl I8042Device {
             mouse_resolution: 2,
             mouse_sample_rate: 100,
             mouse_scaling_21: false,
+            mouse_buttons: 0,
+            pending_mouse_events: VecDeque::new(),
             pending_command: None,
             pending_mouse_command: None,
             pending_keyboard_command: None,
@@ -628,7 +639,7 @@ impl I8042Device {
         self.update_output_buffer_status();
     }
 
-    /// Process a mouse input event and generate a 3-byte mouse packet.
+    /// Process a mouse input event and generate one or more 3-byte mouse packets.
     ///
     /// Standard PS/2 mouse packet format:
     /// Byte 0: bits 0-2 = buttons (L, R, M), bit 3 = 1 (always), bit 4 = X sign,
@@ -639,32 +650,63 @@ impl I8042Device {
         if !self.mouse_enabled || !self.mouse_reporting_enabled {
             return false;
         }
-        if self.output_buffer.len() > MAX_DATA_BUFFER - 3 {
-            debug!("i8042: output buffer full, dropping mouse packet");
+        let buttons = buttons & 0x07;
+        let buttons_changed = self.mouse_buttons != buttons;
+        self.mouse_buttons = buttons;
+        if dx != 0 || dy != 0 || buttons_changed {
+            if let Some(event) = self.pending_mouse_events.back_mut()
+                && event.buttons == buttons
+            {
+                event.dx = event.dx.saturating_add(i32::from(dx));
+                event.dy = event.dy.saturating_add(i32::from(dy));
+                event.buttons_dirty |= buttons_changed;
+            } else {
+                self.pending_mouse_events.push_back(PendingMouseEvent {
+                    buttons,
+                    buttons_dirty: buttons_changed,
+                    dx: i32::from(dx),
+                    dy: i32::from(dy),
+                });
+            }
+        }
+        self.flush_mouse_packets()
+    }
+
+    fn flush_mouse_packets(&mut self) -> bool {
+        if !self.mouse_enabled || !self.mouse_reporting_enabled {
             return false;
         }
+        let mut added = false;
+        while self.output_buffer.len() <= MAX_DATA_BUFFER - 3 {
+            let Some(event) = self.pending_mouse_events.front_mut() else {
+                break;
+            };
+            let x_byte = event.dx.clamp(i8::MIN.into(), i8::MAX.into()) as i8;
+            let y_byte = event.dy.clamp(i8::MIN.into(), i8::MAX.into()) as i8;
 
-        let mut byte0 = 0x08;
-        byte0 |= buttons & 0x07;
+            let mut byte0 = 0x08 | event.buttons;
+            if x_byte.is_negative() {
+                byte0 |= 0x10;
+            }
+            if y_byte.is_negative() {
+                byte0 |= 0x20;
+            }
 
-        let (x_byte, x_overflow) = clamp_to_i8(dx);
-        let (y_byte, y_overflow) = clamp_to_i8(dy);
+            self.push_aux_output_bytes_no_irq(&[byte0, x_byte as u8, y_byte as u8]);
+            let event = self.pending_mouse_events.front_mut().unwrap();
+            event.dx -= i32::from(x_byte);
+            event.dy -= i32::from(y_byte);
+            event.buttons_dirty = false;
+            if event.dx == 0 && event.dy == 0 && !event.buttons_dirty {
+                self.pending_mouse_events.pop_front();
+            }
+            added = true;
+        }
+        added
+    }
 
-        if x_overflow {
-            byte0 |= 0x40;
-        }
-        if y_overflow {
-            byte0 |= 0x80;
-        }
-        if x_byte.is_negative() {
-            byte0 |= 0x10;
-        }
-        if y_byte.is_negative() {
-            byte0 |= 0x20;
-        }
-
-        self.push_aux_output_bytes_no_irq(&[byte0, x_byte as u8, y_byte as u8]);
-        true
+    fn clear_pending_mouse_movement(&mut self) {
+        self.pending_mouse_events.clear();
     }
 
     /// Drain pending input events from the input channel.
@@ -724,6 +766,7 @@ impl I8042Device {
             CMD_DISABLE_SECONDARY => {
                 debug!("i8042: mouse/secondary disabled");
                 self.mouse_enabled = false;
+                self.clear_pending_mouse_movement();
                 self.port_a &= !0x10;
                 self.ctr |= CTR_AUX_DISABLE;
             }
@@ -907,6 +950,7 @@ impl I8042Device {
                 self.mouse_resolution = 2;
                 self.mouse_sample_rate = 100;
                 self.mouse_scaling_21 = false;
+                self.clear_pending_mouse_movement();
                 self.push_aux_output(0xFA);
             }
             // Enable/disable data reporting.
@@ -916,6 +960,7 @@ impl I8042Device {
             }
             0xF5 => {
                 self.mouse_reporting_enabled = false;
+                self.clear_pending_mouse_movement();
                 self.push_aux_output(0xFA);
             }
             // Get device ID for a standard three-button PS/2 mouse.
@@ -929,6 +974,7 @@ impl I8042Device {
                 self.mouse_resolution = 2;
                 self.mouse_sample_rate = 100;
                 self.mouse_scaling_21 = false;
+                self.clear_pending_mouse_movement();
                 self.push_aux_output(0xFA);
                 self.push_aux_output(0xAA);
                 self.push_aux_output(0x00);
@@ -938,17 +984,6 @@ impl I8042Device {
                 self.push_aux_output(0xFA);
             }
         }
-    }
-}
-
-/// Clamp a i16 value to i8 range, returning overflow flag.
-fn clamp_to_i8(v: i16) -> (i8, bool) {
-    if v > i8::MAX as i16 {
-        (i8::MAX, true)
-    } else if v < i8::MIN as i16 {
-        (i8::MIN, true)
-    } else {
-        (v as i8, false)
     }
 }
 
@@ -972,6 +1007,7 @@ impl BusDevice for I8042Device {
                     self.output_buffer_aux.pop_front();
                     data[0] = byte;
                     debug!("i8042: guest read 0x{byte:02x}");
+                    self.flush_mouse_packets();
                     self.update_output_buffer_status();
                     if !self.output_buffer.is_empty() {
                         // More data is available from the source at the front of the queue.
@@ -1058,6 +1094,8 @@ mod tests {
             mouse_resolution: 2,
             mouse_sample_rate: 100,
             mouse_scaling_21: false,
+            mouse_buttons: 0,
+            pending_mouse_events: VecDeque::new(),
             pending_command: None,
             pending_mouse_command: None,
             pending_keyboard_command: None,
@@ -1322,16 +1360,22 @@ mod tests {
     }
 
     #[test]
-    fn test_mouse_overflow() {
+    fn test_mouse_large_movement_is_split() {
         let mut dev = make_device();
         dev.mouse_reporting_enabled = true;
 
         dev.process_mouse_event(0x00, 300, 0);
 
-        assert_eq!(dev.output_buffer.len(), 3);
+        assert_eq!(dev.output_buffer.len(), 9);
         let packet = dev.output_buffer.make_contiguous();
-        assert_ne!(packet[0] & 0x40, 0);
-        assert_eq!(packet[1], i8::MAX as u8);
+        assert_eq!(packet[0] & 0xc0, 0);
+        assert_eq!(packet[3] & 0xc0, 0);
+        assert_eq!(packet[6] & 0xc0, 0);
+        let movement: i16 = packet
+            .chunks_exact(3)
+            .map(|packet| i16::from(packet[1] as i8))
+            .sum();
+        assert_eq!(movement, 300);
     }
 
     #[test]
@@ -1435,13 +1479,50 @@ mod tests {
     }
 
     #[test]
-    fn test_clamp_to_i8() {
-        assert_eq!(clamp_to_i8(0), (0, false));
-        assert_eq!(clamp_to_i8(127), (127, false));
-        assert_eq!(clamp_to_i8(128), (127, true));
-        assert_eq!(clamp_to_i8(-128), (-128, false));
-        assert_eq!(clamp_to_i8(-129), (-128, true));
-        assert_eq!(clamp_to_i8(32767), (127, true));
-        assert_eq!(clamp_to_i8(-32768), (-128, true));
+    fn test_mouse_movement_waits_for_buffer_space() {
+        let mut dev = make_device();
+        dev.mouse_reporting_enabled = true;
+        for _ in 0..MAX_DATA_BUFFER {
+            dev.push_output(0x42);
+        }
+
+        assert!(!dev.process_mouse_event(0, 100, 0));
+        assert_eq!(dev.pending_mouse_events.front().unwrap().dx, 100);
+
+        let mut data = [0u8];
+        for _ in 0..3 {
+            dev.read(0, OFFSET_DATA, &mut data);
+        }
+        assert!(dev.pending_mouse_events.is_empty());
+        assert_eq!(dev.output_buffer.len(), MAX_DATA_BUFFER);
+        assert_eq!(
+            &dev.output_buffer.make_contiguous()[MAX_DATA_BUFFER - 3..],
+            &[0x08, 100, 0]
+        );
+    }
+
+    #[test]
+    fn test_mouse_backlog_preserves_button_transitions() {
+        let mut dev = make_device();
+        dev.mouse_reporting_enabled = true;
+        for _ in 0..MAX_DATA_BUFFER {
+            dev.push_output(0x42);
+        }
+
+        dev.process_mouse_event(0, 100, 0);
+        dev.process_mouse_event(1, 0, 0);
+        dev.process_mouse_event(1, -100, 0);
+        assert_eq!(dev.pending_mouse_events.len(), 2);
+
+        let mut data = [0u8];
+        for _ in 0..MAX_DATA_BUFFER {
+            dev.read(0, OFFSET_DATA, &mut data);
+        }
+        let packets = dev.output_buffer.iter().copied().collect::<Vec<_>>();
+        assert_eq!(packets, &[0x08, 100, 0, 0x19, (-100i8) as u8, 0]);
+        for _ in 0..packets.len() {
+            dev.read(0, OFFSET_DATA, &mut data);
+        }
+        assert!(dev.pending_mouse_events.is_empty());
     }
 }

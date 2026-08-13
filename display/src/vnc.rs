@@ -11,6 +11,8 @@ use log::{debug, error, info, warn};
 use crate::framebuffer::FramebufferSurface;
 
 const MAX_CLIENT_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+const VNC_ENCODING_POINTER_TYPE_CHANGE: i32 = -257;
+const VNC_ENCODING_VMWARE_CURSOR_POSITION: i32 = 0x574d_5666;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PixelFormat {
@@ -104,10 +106,25 @@ struct FramebufferUpdateRequest {
     incremental: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PointerMode {
+    #[default]
+    Legacy,
+    QemuRelative,
+    VmwareRelative,
+}
+
 struct ClientState {
     pixel_format: PixelFormat,
     framebuffer_request: Option<FramebufferUpdateRequest>,
     pointer_button_mask: u8,
+    pointer_mode: PointerMode,
+    last_pointer_position: Option<(u32, u32)>,
+    pointer_center: (u16, u16),
+    cursor_recenter_pending: bool,
+    expecting_cursor_recenter: bool,
+    vmware_recenter_active: bool,
+    vmware_recenter_failed: bool,
 }
 
 impl Default for ClientState {
@@ -116,7 +133,58 @@ impl Default for ClientState {
             pixel_format: XRGB8888_FORMAT,
             framebuffer_request: None,
             pointer_button_mask: 0,
+            pointer_mode: PointerMode::Legacy,
+            last_pointer_position: None,
+            pointer_center: (0, 0),
+            cursor_recenter_pending: false,
+            expecting_cursor_recenter: false,
+            vmware_recenter_active: false,
+            vmware_recenter_failed: false,
         }
+    }
+}
+
+impl ClientState {
+    fn with_framebuffer_size(width: u32, height: u32) -> Result<Self> {
+        let width = u16::try_from(width).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "framebuffer width exceeds the RFB limit",
+            )
+        })?;
+        let height = u16::try_from(height).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "framebuffer height exceeds the RFB limit",
+            )
+        })?;
+        if width == 0 || height == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "framebuffer dimensions must be non-zero",
+            ));
+        }
+
+        Ok(Self {
+            pointer_center: (width / 2, height / 2),
+            ..Self::default()
+        })
+    }
+
+    fn pending_cursor_position(&self) -> Option<(u16, u16)> {
+        (self.pointer_mode == PointerMode::VmwareRelative
+            && !self.vmware_recenter_failed
+            && self.cursor_recenter_pending)
+            .then_some(self.pointer_center)
+    }
+
+    fn cursor_recenter_sent(&mut self) {
+        self.cursor_recenter_pending = false;
+        self.expecting_cursor_recenter = true;
+        self.last_pointer_position = Some((
+            u32::from(self.pointer_center.0),
+            u32::from(self.pointer_center.1),
+        ));
     }
 }
 
@@ -126,7 +194,6 @@ pub enum VncInputEvent {
     Keyboard { key: u32, down: bool },
     MouseButton { button: u8, down: bool },
     PointerMove { dx: i16, dy: i16 },
-    PointerPosition { x: u32, y: u32 },
 }
 
 /// Unified stream type for TCP and Unix sockets
@@ -181,6 +248,16 @@ impl Write for VncStream {
             VncStream::Unix(s) => s.flush(),
         }
     }
+}
+
+fn socket_writable(stream: &VncStream) -> bool {
+    let mut poll_out = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: poll_out contains one valid file descriptor from a live stream.
+    (unsafe { libc::poll(&mut poll_out, 1, 0) }) > 0 && (poll_out.revents & libc::POLLOUT) != 0
 }
 
 /// Unified listener type
@@ -380,6 +457,7 @@ fn handle_client(
         let config = surface.config();
         let width = config.width;
         let height = config.height;
+        ClientState::with_framebuffer_size(width, height)?;
         debug!("vnc: surface config width={} height={}", width, height);
         server_init(&mut *s, width, height)?;
         client_init(&mut *s)?;
@@ -397,7 +475,8 @@ fn handle_client(
     // for the first request also lets the client select its pixel format before
     // any pixel data is transmitted.
     let mut last_data: Option<Vec<u8>> = None;
-    let mut client_state = ClientState::default();
+    let config = surface.config();
+    let mut client_state = ClientState::with_framebuffer_size(config.width, config.height)?;
 
     let fb_interval = Duration::from_millis(40); // 25 FPS for framebuffer updates
     let input_interval = Duration::from_millis(100); // 10 Hz for input polling
@@ -432,10 +511,19 @@ fn handle_client(
                 // Keep non-blocking. Incomplete RFB messages remain buffered until
                 // the rest of the message arrives.
                 info!("vnc: socket readable, draining input");
-                if let Err(e) =
-                    check_client_input(&mut *s, input_sender, &mut input_buffer, &mut client_state)
-                {
-                    return Err(e);
+                let pointer_type_change_pending = check_client_input(
+                    &mut *s,
+                    input_sender,
+                    &mut input_buffer,
+                    &mut client_state,
+                )?;
+                if pointer_type_change_pending {
+                    let config = surface.config();
+                    s.set_nonblocking(false)?;
+                    let send_result =
+                        send_pointer_type_change(&mut *s, config.width, config.height);
+                    s.set_nonblocking(true)?;
+                    send_result?;
                 }
             }
 
@@ -454,17 +542,7 @@ fn handle_client(
 
                     if has_change || !request.incremental {
                         // Check if socket is writable before sending FBU
-                        let mut poll_out = libc::pollfd {
-                            fd: s.as_raw_fd(),
-                            events: libc::POLLOUT,
-                            revents: 0,
-                        };
-                        let writable = {
-                            // SAFETY: fd is valid from live VncStream
-                            (unsafe { libc::poll(&mut poll_out, 1, 0) }) > 0
-                        } && (poll_out.revents & libc::POLLOUT) != 0;
-
-                        if writable {
+                        if socket_writable(&s) {
                             let config = surface.config();
                             // Framebuffer updates can be much larger than the socket send
                             // buffer, especially when sent through nova-novncproxy. The
@@ -481,6 +559,7 @@ fn handle_client(
                                 config.height,
                                 config.stride,
                                 client_state.pixel_format,
+                                client_state.pending_cursor_position(),
                             );
                             s.set_nonblocking(true)?;
 
@@ -495,9 +574,28 @@ fn handle_client(
                             } else {
                                 last_data = Some(current_data);
                                 client_state.framebuffer_request = None;
+                                if client_state.pending_cursor_position().is_some() {
+                                    client_state.cursor_recenter_sent();
+                                }
                                 fb_sent = true;
                             }
                         }
+                    }
+                    if !fb_sent
+                        && client_state.pending_cursor_position().is_some()
+                        && socket_writable(&*s)
+                    {
+                        s.set_nonblocking(false)?;
+                        let send_result = send_cursor_position_update(
+                            &mut *s,
+                            client_state.pointer_center.0,
+                            client_state.pointer_center.1,
+                        );
+                        s.set_nonblocking(true)?;
+                        send_result?;
+                        client_state.framebuffer_request = None;
+                        client_state.cursor_recenter_sent();
+                        fb_sent = true;
                     }
                 }
                 (Some(_), None) => {
@@ -660,6 +758,7 @@ fn send_framebuffer_update<W: Write>(
     height: u32,
     stride: u32,
     pixel_format: PixelFormat,
+    cursor_position: Option<(u16, u16)>,
 ) -> Result<()> {
     let source_row_size = width.checked_mul(4).ok_or_else(|| {
         std::io::Error::new(
@@ -682,7 +781,7 @@ fn send_framebuffer_update<W: Write>(
     // message-type=0 (1 byte), padding (1 byte), number-of-rects (CARD16)
     writer.write_all(&[0])?;
     writer.write_all(&[0])?;
-    writer.write_all(&[0, 1])?;
+    writer.write_all(&(1u16 + u16::from(cursor_position.is_some())).to_be_bytes())?;
 
     // Rectangle: x, y, width, height (all CARD16), encoding (CARD32)
     writer.write_all(&[0, 0])?; // x = 0
@@ -697,8 +796,39 @@ fn send_framebuffer_update<W: Write>(
         let row = &data[y * stride..y * stride + source_row_size];
         write_pixels(writer, row, pixel_format)?;
     }
+    if let Some((x, y)) = cursor_position {
+        write_cursor_position_rectangle(writer, x, y)?;
+    }
     writer.flush()?;
 
+    Ok(())
+}
+
+fn send_cursor_position_update<W: Write>(writer: &mut W, x: u16, y: u16) -> Result<()> {
+    writer.write_all(&[0, 0, 0, 1])?;
+    write_cursor_position_rectangle(writer, x, y)?;
+    writer.flush()
+}
+
+fn write_cursor_position_rectangle<W: Write>(writer: &mut W, x: u16, y: u16) -> Result<()> {
+    writer.write_all(&x.to_be_bytes())?;
+    writer.write_all(&y.to_be_bytes())?;
+    writer.write_all(&0u16.to_be_bytes())?;
+    writer.write_all(&0u16.to_be_bytes())?;
+    writer.write_all(&VNC_ENCODING_VMWARE_CURSOR_POSITION.to_be_bytes())
+}
+
+fn send_pointer_type_change<W: Write>(writer: &mut W, width: u32, height: u32) -> Result<()> {
+    // QEMU's PointerTypeChange extension uses rectangle X=0 for a relative
+    // pointing device. Capable viewers then grab the pointer and send movement
+    // relative to 0x7fff, avoiding clipping at the viewer window edge.
+    writer.write_all(&[0, 0, 0, 1])?;
+    writer.write_all(&0u16.to_be_bytes())?;
+    writer.write_all(&0u16.to_be_bytes())?;
+    writer.write_all(&(width as u16).to_be_bytes())?;
+    writer.write_all(&(height as u16).to_be_bytes())?;
+    writer.write_all(&VNC_ENCODING_POINTER_TYPE_CHANGE.to_be_bytes())?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -738,7 +868,7 @@ fn check_client_input<R: Read>(
     input_sender: &mpsc::Sender<VncInputEvent>,
     input_buffer: &mut Vec<u8>,
     client_state: &mut ClientState,
-) -> Result<()> {
+) -> Result<bool> {
     let mut read_buffer = [0u8; 4096];
 
     loop {
@@ -771,16 +901,22 @@ fn drain_client_input(
     input_buffer: &mut Vec<u8>,
     input_sender: &mpsc::Sender<VncInputEvent>,
     client_state: &mut ClientState,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut pointer_type_changed = false;
     loop {
         let Some(message_size) = client_message_size(input_buffer)? else {
-            return Ok(());
+            return Ok(
+                pointer_type_changed && client_state.pointer_mode == PointerMode::QemuRelative
+            );
         };
         if input_buffer.len() < message_size {
-            return Ok(());
+            return Ok(
+                pointer_type_changed && client_state.pointer_mode == PointerMode::QemuRelative
+            );
         }
 
-        handle_client_message(&input_buffer[..message_size], input_sender, client_state)?;
+        pointer_type_changed |=
+            handle_client_message(&input_buffer[..message_size], input_sender, client_state)?;
         input_buffer.drain(..message_size);
     }
 }
@@ -880,7 +1016,8 @@ fn handle_client_message(
     message: &[u8],
     input_sender: &mpsc::Sender<VncInputEvent>,
     client_state: &mut ClientState,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut pointer_type_changed = false;
     match message[0] {
         0 => {
             let pixel_format = PixelFormat::from_set_pixel_format(message)?;
@@ -894,7 +1031,31 @@ fn handle_client_message(
         }
         2 => {
             let count = u16::from_be_bytes([message[2], message[3]]);
-            debug!("vnc: SetEncodings count={count}");
+            let encodings = message[4..]
+                .chunks_exact(4)
+                .map(|encoding| i32::from_be_bytes(encoding.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            debug!("vnc: SetEncodings count={count} encodings={encodings:?}");
+            let pointer_mode = if encodings.contains(&VNC_ENCODING_POINTER_TYPE_CHANGE) {
+                PointerMode::QemuRelative
+            } else if encodings.contains(&VNC_ENCODING_VMWARE_CURSOR_POSITION) {
+                PointerMode::VmwareRelative
+            } else {
+                PointerMode::Legacy
+            };
+            let pointer_mode_changed = pointer_mode != client_state.pointer_mode;
+            if pointer_mode_changed {
+                client_state.pointer_mode = pointer_mode;
+                client_state.last_pointer_position = None;
+                client_state.cursor_recenter_pending = pointer_mode == PointerMode::VmwareRelative;
+                client_state.expecting_cursor_recenter = false;
+                client_state.vmware_recenter_active = false;
+                client_state.vmware_recenter_failed = false;
+                info!("vnc: client pointer mode changed to {pointer_mode:?}");
+            }
+            if pointer_mode == PointerMode::QemuRelative && pointer_mode_changed {
+                pointer_type_changed = true;
+            }
         }
         3 => {
             let incremental = message[1] != 0;
@@ -929,7 +1090,86 @@ fn handle_client_message(
                 }
             }
             client_state.pointer_button_mask = mask;
-            let _ = input_sender.send(VncInputEvent::PointerPosition { x, y });
+
+            let movement = match client_state.pointer_mode {
+                PointerMode::QemuRelative => Some((
+                    (i32::from(x as u16) - 0x7fff).clamp(i16::MIN.into(), i16::MAX.into()) as i16,
+                    (0x7fff - i32::from(y as u16)).clamp(i16::MIN.into(), i16::MAX.into()) as i16,
+                )),
+                PointerMode::VmwareRelative => {
+                    let center = (
+                        u32::from(client_state.pointer_center.0),
+                        u32::from(client_state.pointer_center.1),
+                    );
+                    let at_center = (x, y) == center;
+                    if client_state.expecting_cursor_recenter && at_center {
+                        client_state.expecting_cursor_recenter = false;
+                        client_state.vmware_recenter_active = true;
+                        client_state.last_pointer_position = Some(center);
+                        None
+                    } else if !client_state.vmware_recenter_active {
+                        let warp_was_expected = client_state.expecting_cursor_recenter;
+                        client_state.expecting_cursor_recenter = false;
+                        if warp_was_expected {
+                            client_state.vmware_recenter_failed = true;
+                            client_state.cursor_recenter_pending = false;
+                        }
+                        let movement = if warp_was_expected {
+                            None
+                        } else {
+                            client_state
+                                .last_pointer_position
+                                .map(|(previous_x, previous_y)| {
+                                    (
+                                        (i64::from(x) - i64::from(previous_x))
+                                            .clamp(i64::from(i16::MIN), i64::from(i16::MAX))
+                                            as i16,
+                                        (i64::from(previous_y) - i64::from(y))
+                                            .clamp(i64::from(i16::MIN), i64::from(i16::MAX))
+                                            as i16,
+                                    )
+                                })
+                        };
+                        client_state.last_pointer_position = Some((x, y));
+                        movement
+                    } else {
+                        client_state.expecting_cursor_recenter = false;
+                        client_state.cursor_recenter_pending = !at_center;
+                        let previous = client_state.last_pointer_position.unwrap_or(center);
+                        client_state.last_pointer_position = Some((x, y));
+                        Some((
+                            (i64::from(x) - i64::from(previous.0))
+                                .clamp(i64::from(i16::MIN), i64::from(i16::MAX))
+                                as i16,
+                            (i64::from(previous.1) - i64::from(y))
+                                .clamp(i64::from(i16::MIN), i64::from(i16::MAX))
+                                as i16,
+                        ))
+                    }
+                }
+                PointerMode::Legacy => {
+                    let movement =
+                        client_state
+                            .last_pointer_position
+                            .map(|(previous_x, previous_y)| {
+                                (
+                                    (i64::from(x) - i64::from(previous_x))
+                                        .clamp(i64::from(i16::MIN), i64::from(i16::MAX))
+                                        as i16,
+                                    (i64::from(previous_y) - i64::from(y))
+                                        .clamp(i64::from(i16::MIN), i64::from(i16::MAX))
+                                        as i16,
+                                )
+                            });
+                    client_state.last_pointer_position = Some((x, y));
+                    movement
+                }
+            };
+            if let Some((dx, dy)) = movement
+                && (dx != 0 || dy != 0)
+            {
+                let _ = input_sender.send(VncInputEvent::PointerMove { dx, dy });
+            }
 
             debug!("vnc: pointer event mask={mask} x={x} y={y}");
         }
@@ -957,7 +1197,7 @@ fn handle_client_message(
         _ => unreachable!("client_message_size validates message types"),
     }
 
-    Ok(())
+    Ok(pointer_type_changed)
 }
 
 #[cfg(test)]
@@ -1206,10 +1446,6 @@ mod tests {
         let mut client_state = ClientState::default();
 
         handle_client_message(&[5, 0, 0, 10, 0, 20], &input_sender, &mut client_state).unwrap();
-        assert!(matches!(
-            input_receiver.recv().unwrap(),
-            VncInputEvent::PointerPosition { x: 10, y: 20 }
-        ));
         assert!(input_receiver.try_recv().is_err());
 
         handle_client_message(&[5, 1, 0, 11, 0, 21], &input_sender, &mut client_state).unwrap();
@@ -1222,8 +1458,195 @@ mod tests {
         ));
         assert!(matches!(
             input_receiver.recv().unwrap(),
-            VncInputEvent::PointerPosition { x: 11, y: 21 }
+            VncInputEvent::PointerMove { dx: 1, dy: -1 }
         ));
         assert!(input_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_relative_pointer_extension() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let mut client_state = ClientState::default();
+        let encoding = VNC_ENCODING_POINTER_TYPE_CHANGE.to_be_bytes();
+        let message = [
+            2,
+            0,
+            0,
+            1,
+            encoding[0],
+            encoding[1],
+            encoding[2],
+            encoding[3],
+        ];
+
+        assert!(handle_client_message(&message, &input_sender, &mut client_state).unwrap());
+        assert_eq!(client_state.pointer_mode, PointerMode::QemuRelative);
+
+        handle_client_message(
+            &[5, 0, 0x80, 0x09, 0x7f, 0xfb],
+            &input_sender,
+            &mut client_state,
+        )
+        .unwrap();
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::PointerMove { dx: 10, dy: 4 }
+        ));
+
+        let mut output = Vec::new();
+        send_pointer_type_change(&mut output, 1024, 768).unwrap();
+        assert_eq!(&output[..4], &[0, 0, 0, 1]);
+        assert_eq!(&output[4..6], &[0, 0]);
+        assert_eq!(&output[8..10], &1024u16.to_be_bytes());
+        assert_eq!(&output[10..12], &768u16.to_be_bytes());
+        assert_eq!(&output[12..16], &encoding);
+    }
+
+    #[test]
+    fn test_vmware_cursor_position_relative_pointer() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let mut client_state = ClientState::with_framebuffer_size(1024, 768).unwrap();
+        let encoding = VNC_ENCODING_VMWARE_CURSOR_POSITION.to_be_bytes();
+        let message = [
+            2,
+            0,
+            0,
+            1,
+            encoding[0],
+            encoding[1],
+            encoding[2],
+            encoding[3],
+        ];
+
+        assert!(!handle_client_message(&message, &input_sender, &mut client_state).unwrap());
+        assert_eq!(client_state.pointer_mode, PointerMode::VmwareRelative);
+        assert_eq!(client_state.pending_cursor_position(), Some((512, 384)));
+
+        let mut output = Vec::new();
+        send_cursor_position_update(&mut output, 512, 384).unwrap();
+        assert_eq!(
+            output,
+            [
+                0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x57, 0x4d,
+                0x56, 0x66,
+            ]
+        );
+
+        client_state.cursor_recenter_sent();
+        handle_client_message(
+            &[5, 0, 0x02, 0x00, 0x01, 0x80],
+            &input_sender,
+            &mut client_state,
+        )
+        .unwrap();
+        assert!(input_receiver.try_recv().is_err());
+
+        handle_client_message(
+            &[5, 0, 0x02, 0x0a, 0x01, 0x7c],
+            &input_sender,
+            &mut client_state,
+        )
+        .unwrap();
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::PointerMove { dx: 10, dy: 4 }
+        ));
+        assert_eq!(client_state.pending_cursor_position(), Some((512, 384)));
+
+        handle_client_message(
+            &[5, 0, 0x02, 0x14, 0x01, 0x78],
+            &input_sender,
+            &mut client_state,
+        )
+        .unwrap();
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::PointerMove { dx: 10, dy: 4 }
+        ));
+
+        client_state.cursor_recenter_sent();
+        handle_client_message(
+            &[5, 0, 0x02, 0x00, 0x01, 0x80],
+            &input_sender,
+            &mut client_state,
+        )
+        .unwrap();
+        assert!(input_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_vmware_cursor_position_falls_back_without_warp() {
+        let (input_sender, input_receiver) = mpsc::channel();
+        let mut client_state = ClientState::with_framebuffer_size(1024, 768).unwrap();
+        client_state.pointer_mode = PointerMode::VmwareRelative;
+        client_state.cursor_recenter_pending = true;
+        client_state.cursor_recenter_sent();
+
+        handle_client_message(&[5, 0, 0, 10, 0, 20], &input_sender, &mut client_state).unwrap();
+        assert!(input_receiver.try_recv().is_err());
+        assert!(!client_state.vmware_recenter_active);
+        assert!(client_state.vmware_recenter_failed);
+        assert_eq!(client_state.pending_cursor_position(), None);
+
+        handle_client_message(&[5, 0, 0, 11, 0, 21], &input_sender, &mut client_state).unwrap();
+        assert!(matches!(
+            input_receiver.recv().unwrap(),
+            VncInputEvent::PointerMove { dx: 1, dy: -1 }
+        ));
+    }
+
+    #[test]
+    fn test_set_encodings_disables_pointer_extensions() {
+        let (input_sender, _input_receiver) = mpsc::channel();
+        let mut client_state = ClientState::with_framebuffer_size(1024, 768).unwrap();
+        let encoding = VNC_ENCODING_VMWARE_CURSOR_POSITION.to_be_bytes();
+        handle_client_message(
+            &[
+                2,
+                0,
+                0,
+                1,
+                encoding[0],
+                encoding[1],
+                encoding[2],
+                encoding[3],
+            ],
+            &input_sender,
+            &mut client_state,
+        )
+        .unwrap();
+        assert_eq!(client_state.pointer_mode, PointerMode::VmwareRelative);
+
+        handle_client_message(&[2, 0, 0, 1, 0, 0, 0, 0], &input_sender, &mut client_state).unwrap();
+        assert_eq!(client_state.pointer_mode, PointerMode::Legacy);
+        assert_eq!(client_state.pending_cursor_position(), None);
+    }
+
+    #[test]
+    fn test_set_encodings_withdraws_pending_pointer_type_change() {
+        let (input_sender, _input_receiver) = mpsc::channel();
+        let mut client_state = ClientState::default();
+        let encoding = VNC_ENCODING_POINTER_TYPE_CHANGE.to_be_bytes();
+        let mut input_buffer = vec![
+            2,
+            0,
+            0,
+            1,
+            encoding[0],
+            encoding[1],
+            encoding[2],
+            encoding[3],
+            2,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+        ];
+
+        assert!(!drain_client_input(&mut input_buffer, &input_sender, &mut client_state).unwrap());
+        assert_eq!(client_state.pointer_mode, PointerMode::Legacy);
     }
 }
