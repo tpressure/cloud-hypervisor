@@ -1708,7 +1708,18 @@ impl NvmeController {
             phase
         );
 
-        let cqe = NvmeCqe::new(cid, phase, status, sq_id, 0, result);
+        // SQHD reports the current head of the submission queue identified by
+        // SQID. Guests use it to reclaim submission entries, and multiple SQs
+        // may share this completion queue.
+        let sq_head = if sq_id == 0 {
+            self.admin_queue.sq_head
+        } else if let Some(queue) = self.io_queues.get(sq_id as usize - 1) {
+            queue.sq_head
+        } else {
+            error!("Invalid SQ ID {} for completion", sq_id);
+            return;
+        };
+        let cqe = NvmeCqe::new(cid, phase, status, sq_id, sq_head, result);
         let mut cqe_bytes = [0u8; 16];
         // SAFETY: NvmeCqe is a simple struct with no padding issues, and we're
         // copying exactly 16 bytes which matches the struct size.
