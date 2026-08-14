@@ -676,13 +676,14 @@ impl I8042Device {
         if !self.mouse_enabled || !self.mouse_reporting_enabled {
             return false;
         }
+        let output_was_empty = self.output_buffer.is_empty();
         let mut added = false;
         while self.output_buffer.len() <= MAX_DATA_BUFFER - 3 {
             let Some(event) = self.pending_mouse_events.front_mut() else {
                 break;
             };
-            let x_byte = event.dx.clamp(i8::MIN.into(), i8::MAX.into()) as i8;
-            let y_byte = event.dy.clamp(i8::MIN.into(), i8::MAX.into()) as i8;
+            let x_byte = event.dx.clamp(-i32::from(i8::MAX), i32::from(i8::MAX)) as i8;
+            let y_byte = event.dy.clamp(-i32::from(i8::MAX), i32::from(i8::MAX)) as i8;
 
             let mut byte0 = 0x08 | event.buttons;
             if x_byte.is_negative() {
@@ -702,7 +703,7 @@ impl I8042Device {
             }
             added = true;
         }
-        added
+        added && output_was_empty
     }
 
     fn clear_pending_mouse_movement(&mut self) {
@@ -1376,6 +1377,19 @@ mod tests {
             .map(|packet| i16::from(packet[1] as i8))
             .sum();
         assert_eq!(movement, 300);
+    }
+
+    #[test]
+    fn test_mouse_negative_movement_uses_qemu_packet_range() {
+        let mut dev = make_device();
+        dev.mouse_reporting_enabled = true;
+
+        dev.process_mouse_event(0, -128, 0);
+
+        assert_eq!(dev.output_buffer.len(), 6);
+        let packets = dev.output_buffer.make_contiguous();
+        assert_eq!(packets[1] as i8, -127);
+        assert_eq!(packets[4] as i8, -1);
     }
 
     #[test]

@@ -60,15 +60,15 @@ use devices::legacy::{
     FwCfg,
     fw_cfg::{PORT_FW_CFG_BASE, PORT_FW_CFG_WIDTH},
 };
-#[cfg(feature = "fw_cfg")]
-use display::framebuffer::FramebufferSurface;
-#[cfg(feature = "fw_cfg")]
-use display::ramfb::{RamfbConfig, RAMFB_CONFIG_SIZE};
-#[cfg(feature = "fw_cfg")]
-use display::vnc::{VncListenerType, VncServer, VncServerConfig};
 #[cfg(feature = "pvmemcontrol")]
 use devices::pvmemcontrol::{PvmemcontrolBusDevice, PvmemcontrolPciDevice};
 use devices::{AcpiNotificationFlags, interrupt_controller};
+#[cfg(feature = "fw_cfg")]
+use display::framebuffer::FramebufferSurface;
+#[cfg(feature = "fw_cfg")]
+use display::ramfb::{RAMFB_CONFIG_SIZE, RamfbConfig};
+#[cfg(feature = "fw_cfg")]
+use display::vnc::{VncListenerType, VncServer, VncServerConfig};
 use event_monitor::event;
 use hypervisor::IoEventAddress;
 #[cfg(target_arch = "aarch64")]
@@ -80,12 +80,12 @@ use libc::{
     termios,
 };
 use log::{debug, error, info, warn};
+use nvme::NvmeController;
 use pci::{
     DeviceRelocation, MmioRegion, PciBarRegionType, PciBdf, PciDevice, VfioDmaMapping,
     VfioPciDevice, VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError,
 };
 use rate_limiter::group::RateLimiterGroup;
-use nvme::NvmeController;
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1317,11 +1317,6 @@ fn forward_vnc_mouse_event(
     dx: i16,
     dy: i16,
 ) {
-    // Reserve room for the three-byte PS/2 packet before generating it.
-    if i8042.lock().unwrap().output_buffer_near_full() {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
     let need_irq = i8042.lock().unwrap().process_mouse_event(buttons, dx, dy);
     if need_irq {
         if let Some(irq) = mouse_irq {
@@ -1808,7 +1803,11 @@ impl DeviceManager {
                     surface_callback.set_config(ramfb_config);
                 }
             } else {
-                debug!("ramfb: callback with unexpected size {} (expected {})", bytes.len(), RAMFB_CONFIG_SIZE);
+                debug!(
+                    "ramfb: callback with unexpected size {} (expected {})",
+                    bytes.len(),
+                    RAMFB_CONFIG_SIZE
+                );
             }
         }));
 
@@ -1845,7 +1844,6 @@ impl DeviceManager {
             let bridge_handle = std::thread::Builder::new()
                 .name("ch-vnc-bridge".to_string())
                 .spawn(move || {
-                    let mut mouse_buttons = 0u8;
                     for event in input_receiver.iter() {
                         match event {
                             display::vnc::VncInputEvent::Keyboard { key, down } => {
@@ -1873,40 +1871,17 @@ impl DeviceManager {
                                     }
                                 }
                             }
-                            display::vnc::VncInputEvent::MouseButton { button, down } => {
-                                let button_mask = match button {
-                                    0 => 0x01, // VNC left -> PS/2 left
-                                    1 => 0x04, // VNC middle -> PS/2 middle
-                                    2 => 0x02, // VNC right -> PS/2 right
-                                    _ => continue,
-                                };
-                                let new_buttons = if down {
-                                    mouse_buttons | button_mask
-                                } else {
-                                    mouse_buttons & !button_mask
-                                };
-                                if new_buttons != mouse_buttons {
-                                    mouse_buttons = new_buttons;
-                                    forward_vnc_mouse_event(
-                                        &i8042,
-                                        &mouse_irq,
-                                        mouse_buttons,
-                                        0,
-                                        0,
-                                    );
-                                }
-                            }
-                            display::vnc::VncInputEvent::PointerMove { dx, dy } => {
-                                forward_vnc_mouse_event(&i8042, &mouse_irq, mouse_buttons, dx, dy);
+                            display::vnc::VncInputEvent::Pointer { buttons, dx, dy } => {
+                                forward_vnc_mouse_event(&i8042, &mouse_irq, buttons, dx, dy);
                             }
                         }
                     }
                 })
                 .map_err(|e| {
                     error!("vnc: failed to spawn bridge thread: {e}");
-                    DeviceManagerError::VncBridgeSpawn(std::io::Error::other(
-                        format!("failed to spawn bridge thread: {e}"),
-                    ))
+                    DeviceManagerError::VncBridgeSpawn(std::io::Error::other(format!(
+                        "failed to spawn bridge thread: {e}"
+                    )))
                 })?;
             self.vnc_bridge_handle = Some(bridge_handle);
         }
@@ -2350,14 +2325,10 @@ impl DeviceManager {
             .clone();
         // Add a shutdown device (i8042) with PS/2 keyboard/mouse support.
         let keyboard_irq = legacy_interrupt_manager
-            .create_group(LegacyIrqGroupConfig {
-                irq: 1,
-            })
+            .create_group(LegacyIrqGroupConfig { irq: 1 })
             .ok();
         let mouse_irq = legacy_interrupt_manager
-            .create_group(LegacyIrqGroupConfig {
-                irq: 12,
-            })
+            .create_group(LegacyIrqGroupConfig { irq: 12 })
             .ok();
         #[cfg(feature = "fw_cfg")]
         let i8042 = Arc::new(Mutex::new(devices::legacy::I8042Device::new(
@@ -3268,16 +3239,18 @@ impl DeviceManager {
             disk_cfg.pci_common.pci_device_id,
         )?;
 
-        let nvme_device = Arc::new(Mutex::new(NvmeController::new(
-            id.clone(),
-            disk_path,
-            disk_cfg.readonly,
-            self.msi_interrupt_manager.clone(),
-            self.memory_manager.lock().unwrap().guest_memory(),
-            pci_device_bdf.device(),
-            self.config.lock().unwrap().cpus.boot_vcpus,
-        )
-        .map_err(DeviceManagerError::Nvme)?));
+        let nvme_device = Arc::new(Mutex::new(
+            NvmeController::new(
+                id.clone(),
+                disk_path,
+                disk_cfg.readonly,
+                self.msi_interrupt_manager.clone(),
+                self.memory_manager.lock().unwrap().guest_memory(),
+                pci_device_bdf.device(),
+                self.config.lock().unwrap().cpus.boot_vcpus,
+            )
+            .map_err(DeviceManagerError::Nvme)?,
+        ));
 
         let nvme_device_clone = Arc::clone(&nvme_device);
         let new_resources = self.add_pci_device(
@@ -3294,13 +3267,9 @@ impl DeviceManager {
         node.resources = new_resources;
         node.pci_bdf = Some(pci_device_bdf);
 
-        self.device_tree
-            .lock()
-            .unwrap()
-            .insert(id.clone(), node);
+        self.device_tree.lock().unwrap().insert(id.clone(), node);
 
-        self.device_id_to_bdf
-            .insert(id.clone(), pci_device_bdf);
+        self.device_id_to_bdf.insert(id.clone(), pci_device_bdf);
 
         Ok(nvme_device)
     }
