@@ -1,0 +1,14 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "vfio_user_common"
+version = "0.1.0"
+
+[dependencies]
+libc = { workspace = true }
+log = { workspace = true }
+vfio_user = { workspace = true }
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+
+[lints]
+workspace = true

@@ -2638,6 +2638,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vfio-usb-hid"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "log",
+ "vfio-bindings",
+ "vfio_user",
+ "vfio_user_common",
+]
+
+[[package]]
 name = "vfio_user"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2656,19 +2668,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "vfio_user_common"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "vfio_user",
+ "vm-memory",
+]
+
+[[package]]
 name = "vfio_user_simplefb"
 version = "0.1.0"
 dependencies = [
  "clap",
  "display",
  "env_logger",
- "libc",
  "log",
  "signal-hook",
  "thiserror",
  "vfio-bindings",
  "vfio_user",
- "vm-memory",
+ "vfio_user_common",
 ]
 
 [[package]]

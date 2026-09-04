@@ -54,6 +54,8 @@ members = [
   "vm-migration",
   "vm-virtio",
   "vmm",
+  "vfio_user_common",
+  "vfio_usb_hid",
 ]
 package.edition = "2024"
 # Minimum buildable version:
