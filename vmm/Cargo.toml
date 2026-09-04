@@ -51,7 +51,6 @@ blocking = { version = "1.6.2", optional = true }
 cfg-if = { workspace = true }
 clap = { workspace = true }
 devices = { path = "../devices" }
-display = { path = "../display" }
 dhat = { workspace = true, optional = true }
 epoll = { workspace = true }
 event_monitor = { path = "../event_monitor" }

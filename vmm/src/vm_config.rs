@@ -759,10 +759,11 @@ impl ApplyLandlock for DebugConsoleConfig {
 #[serde(rename_all = "lowercase")]
 pub enum DisplayBackend {
     #[default]
+    Off,
     Ramfb,
 }
 
-/// VNC listener type for the display subsystem.
+/// Legacy in-process VNC listener configuration.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum VncListenerConfig {
@@ -772,7 +773,7 @@ pub enum VncListenerConfig {
     Tcp { port: u16 },
 }
 
-/// Configuration for the display subsystem (ramfb + VNC).
+/// Configuration for the firmware RAMFB display.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DisplayConfig {
     #[serde(default)]
@@ -795,7 +796,7 @@ fn default_display_height() -> u32 {
 impl Default for DisplayConfig {
     fn default() -> Self {
         Self {
-            backend: DisplayBackend::default(),
+            backend: DisplayBackend::Off,
             vnc: None,
             width: default_display_width(),
             height: default_display_height(),
@@ -804,7 +805,7 @@ impl Default for DisplayConfig {
 }
 
 impl DisplayConfig {
-    pub const SYNTAX: &str = "ramfb,vnc=unix:<path>|tcp:<port>,width=<w>,height=<h>";
+    pub const SYNTAX: &str = "off|ramfb";
 }
 
 impl ApplyLandlock for DisplayConfig {

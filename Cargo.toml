@@ -47,6 +47,7 @@ members = [
   "tracer",
   "vhost_user_block",
   "vhost_user_net",
+  "vfio_user_simplefb",
   "virtio-devices",
   "vm-allocator",
   "vm-device",

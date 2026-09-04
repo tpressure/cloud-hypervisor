@@ -60,12 +60,6 @@ use devices::legacy::{
     FwCfg,
     fw_cfg::{PORT_FW_CFG_BASE, PORT_FW_CFG_WIDTH},
 };
-#[cfg(feature = "fw_cfg")]
-use display::framebuffer::FramebufferSurface;
-#[cfg(feature = "fw_cfg")]
-use display::ramfb::{RamfbConfig, RAMFB_CONFIG_SIZE};
-#[cfg(feature = "fw_cfg")]
-use display::vnc::{VncListenerType, VncServer, VncServerConfig};
 #[cfg(feature = "pvmemcontrol")]
 use devices::pvmemcontrol::{PvmemcontrolBusDevice, PvmemcontrolPciDevice};
 use devices::{AcpiNotificationFlags, interrupt_controller};
@@ -132,7 +126,7 @@ use crate::vm_config::{
     ConsoleOutputMode, DEFAULT_IOMMU_ADDRESS_WIDTH_BITS, DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT,
     DeviceConfig, DiskConfig, DiskTransport, FsConfig, GenericVhostUserConfig, NetConfig,
     PciDeviceCommonConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VhostMode, VmConfig,
-    VncListenerConfig, VsockConfig,
+    VsockConfig,
 };
 use crate::{DEVICE_MANAGER_SNAPSHOT_ID, GuestRegionMmap, PciDeviceInfo, device_node};
 
@@ -762,14 +756,6 @@ pub enum DeviceManagerError {
         specified: ImageType,
         detected: ImageType,
     },
-
-    /// Failed to spawn VNC server thread.
-    #[error("Failed to spawn VNC server thread")]
-    VncServerSpawn(#[source] std::io::Error),
-
-    /// Failed to spawn VNC input bridge thread.
-    #[error("Failed to spawn VNC input bridge thread")]
-    VncBridgeSpawn(#[source] std::io::Error),
 }
 
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
@@ -1241,19 +1227,7 @@ pub struct DeviceManager {
     fw_cfg: Option<Arc<Mutex<FwCfg>>>,
 
     #[cfg(feature = "fw_cfg")]
-    framebuffer_surface: Option<Arc<FramebufferSurface>>,
-
-    #[cfg(feature = "fw_cfg")]
-    vnc_server: Option<VncServer>,
-
-    #[cfg(feature = "fw_cfg")]
     input_channel: Option<Arc<Mutex<VecDeque<devices::legacy::InputEvent>>>>,
-
-    #[cfg(feature = "fw_cfg")]
-    vnc_server_handle: Option<std::thread::JoinHandle<()>>,
-
-    #[cfg(feature = "fw_cfg")]
-    vnc_bridge_handle: Option<std::thread::JoinHandle<()>>,
 
     #[cfg(feature = "fw_cfg")]
     i8042: Option<Arc<Mutex<devices::legacy::I8042Device>>>,
@@ -1307,29 +1281,6 @@ fn use_64bit_bar_for_virtio_device(
     is_hotplug: bool,
 ) -> bool {
     pci_segment_id > 0 || device_type != VirtioDeviceType::Block as u32 || is_hotplug
-}
-
-#[cfg(feature = "fw_cfg")]
-fn forward_vnc_mouse_event(
-    i8042: &Arc<Mutex<devices::legacy::I8042Device>>,
-    mouse_irq: &Option<Arc<dyn vm_device::interrupt::InterruptSourceGroup>>,
-    buttons: u8,
-    dx: i16,
-    dy: i16,
-) {
-    // Reserve room for the three-byte PS/2 packet before generating it.
-    if i8042.lock().unwrap().output_buffer_near_full() {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    let need_irq = i8042.lock().unwrap().process_mouse_event(buttons, dx, dy);
-    if need_irq {
-        if let Some(irq) = mouse_irq {
-            if let Err(error) = irq.trigger(0) {
-                warn!("vnc-bridge: failed to trigger mouse IRQ: {error}");
-            }
-        }
-    }
 }
 
 impl DeviceManager {
@@ -1573,15 +1524,7 @@ impl DeviceManager {
             #[cfg(feature = "fw_cfg")]
             fw_cfg: None,
             #[cfg(feature = "fw_cfg")]
-            framebuffer_surface: None,
-            #[cfg(feature = "fw_cfg")]
-            vnc_server: None,
-            #[cfg(feature = "fw_cfg")]
             input_channel: None,
-            #[cfg(feature = "fw_cfg")]
-            vnc_server_handle: None,
-            #[cfg(feature = "fw_cfg")]
-            vnc_bridge_handle: None,
             #[cfg(feature = "fw_cfg")]
             i8042: None,
             #[cfg(feature = "ivshmem")]
@@ -1721,9 +1664,6 @@ impl DeviceManager {
             self.ivshmem_device = self.add_ivshmem_device(ivshmem, snapshot)?;
         }
 
-        #[cfg(feature = "fw_cfg")]
-        self.create_display()?;
-
         Ok(())
     }
 
@@ -1771,188 +1711,6 @@ impl DeviceManager {
                 },
             );
         }
-        Ok(())
-    }
-
-    #[cfg(feature = "fw_cfg")]
-    fn create_display(&mut self) -> DeviceManagerResult<()> {
-        let config = self.config.lock().unwrap();
-        let display_config = &config.display;
-
-        if display_config.vnc.is_none() {
-            return Ok(());
-        }
-
-        let guest_memory = self.memory_manager.lock().unwrap().guest_memory();
-        let surface = Arc::new(FramebufferSurface::new(guest_memory));
-
-        let surface_callback = Arc::clone(&surface);
-        let callback = Arc::new(Mutex::new(move |bytes: &[u8]| {
-            info!("ramfb: callback triggered with {} bytes", bytes.len());
-            if bytes.len() == RAMFB_CONFIG_SIZE {
-                let mut buf = [0u8; RAMFB_CONFIG_SIZE];
-                buf.copy_from_slice(bytes);
-                let ramfb_config = RamfbConfig::from_be_bytes(&buf);
-                let r_addr = ramfb_config.address;
-                let r_fourcc = ramfb_config.fourcc;
-                let r_flags = ramfb_config.flags;
-                let r_width = ramfb_config.width;
-                let r_height = ramfb_config.height;
-                let r_stride = ramfb_config.stride;
-                info!(
-                    "ramfb: config received address=0x{:x}, fourcc=0x{:08X}, flags=0x{:08X}, \
-                     width={}, height={}, stride={}",
-                    r_addr, r_fourcc, r_flags, r_width, r_height, r_stride
-                );
-                if r_addr != 0 {
-                    surface_callback.set_config(ramfb_config);
-                }
-            } else {
-                debug!("ramfb: callback with unexpected size {} (expected {})", bytes.len(), RAMFB_CONFIG_SIZE);
-            }
-        }));
-
-        if let Some(ref fw_cfg) = self.fw_cfg {
-            fw_cfg.lock().unwrap().set_ramfb_write_callback(callback);
-        }
-
-        let vnc_config = match &display_config.vnc {
-            Some(VncListenerConfig::Tcp { port }) => VncServerConfig {
-                listener: VncListenerType::Tcp { port: *port },
-            },
-            Some(VncListenerConfig::Unix { path }) => VncServerConfig {
-                listener: VncListenerType::Unix {
-                    path: path.to_string_lossy().to_string(),
-                },
-            },
-            None => return Ok(()),
-        };
-
-        let (input_sender, input_receiver) = std::sync::mpsc::channel();
-        let surface_for_vnc = Arc::clone(&surface);
-        let vnc_server = VncServer::new(surface_for_vnc, vnc_config, input_sender);
-        let vnc_handle = vnc_server.spawn().map_err(|e| {
-            error!("vnc: failed to spawn VNC server: {e}");
-            DeviceManagerError::VncServerSpawn(e)
-        })?;
-
-        // Spawn bridge thread to forward VNC input events to i8042
-        if let Some(i8042) = self.i8042.as_ref() {
-            let i8042: Arc<Mutex<devices::legacy::I8042Device>> = Arc::clone(i8042);
-            // Get IRQs for triggering after releasing the i8042 lock.
-            let keyboard_irq = i8042.lock().unwrap().keyboard_irq();
-            let mouse_irq = i8042.lock().unwrap().mouse_irq();
-            let bridge_handle = std::thread::Builder::new()
-                .name("ch-vnc-bridge".to_string())
-                .spawn(move || {
-                    let mut mouse_buttons = 0u8;
-                    let mut last_pointer_position = None;
-                    for event in input_receiver.iter() {
-                        match event {
-                            display::vnc::VncInputEvent::Keyboard { key, down } => {
-                                info!("vnc-bridge: keyboard key=0x{key:x} down={down}");
-                                // Backpressure: wait if PS/2 output buffer is nearly full
-                                // so the guest has time to read scan codes via the data port
-                                if i8042.lock().unwrap().output_buffer_near_full() {
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                }
-                                // Lock i8042, process event, then drop lock BEFORE triggering IRQ
-                                let need_irq = {
-                                    let mut dev = i8042.lock().unwrap();
-                                    dev.process_keyboard_event(key, down)
-                                };
-                                // Lock is now dropped, vCPU can read data port
-                                if need_irq {
-                                    if let Some(ref irq) = keyboard_irq {
-                                        if let Err(e) = irq.trigger(0) {
-                                            warn!("vnc-bridge: failed to trigger IRQ: {e}");
-                                        } else {
-                                            info!("vnc-bridge: IRQ triggered for keyboard event");
-                                        }
-                                    } else {
-                                        info!("vnc-bridge: no IRQ available for keyboard event");
-                                    }
-                                }
-                            }
-                            display::vnc::VncInputEvent::MouseButton { button, down } => {
-                                let button_mask = match button {
-                                    0 => 0x01, // VNC left -> PS/2 left
-                                    1 => 0x04, // VNC middle -> PS/2 middle
-                                    2 => 0x02, // VNC right -> PS/2 right
-                                    _ => continue,
-                                };
-                                let new_buttons = if down {
-                                    mouse_buttons | button_mask
-                                } else {
-                                    mouse_buttons & !button_mask
-                                };
-                                if new_buttons != mouse_buttons {
-                                    mouse_buttons = new_buttons;
-                                    forward_vnc_mouse_event(
-                                        &i8042,
-                                        &mouse_irq,
-                                        mouse_buttons,
-                                        0,
-                                        0,
-                                    );
-                                }
-                            }
-                            display::vnc::VncInputEvent::PointerMove { dx, dy } => {
-                                forward_vnc_mouse_event(
-                                    &i8042,
-                                    &mouse_irq,
-                                    mouse_buttons,
-                                    dx,
-                                    dy,
-                                );
-                            }
-                            display::vnc::VncInputEvent::PointerPosition { x, y } => {
-                                if let Some((previous_x, previous_y)) = last_pointer_position {
-                                    let dx = i16::try_from(x as i64 - previous_x as i64)
-                                        .unwrap_or_else(|_| {
-                                            if x > previous_x {
-                                                i16::MAX
-                                            } else {
-                                                i16::MIN
-                                            }
-                                        });
-                                    // VNC uses a downward-positive Y axis, while PS/2 uses upward-positive.
-                                    let dy = i16::try_from(previous_y as i64 - y as i64)
-                                        .unwrap_or_else(|_| {
-                                            if y < previous_y {
-                                                i16::MAX
-                                            } else {
-                                                i16::MIN
-                                            }
-                                        });
-                                    if dx != 0 || dy != 0 {
-                                        forward_vnc_mouse_event(
-                                            &i8042,
-                                            &mouse_irq,
-                                            mouse_buttons,
-                                            dx,
-                                            dy,
-                                        );
-                                    }
-                                }
-                                last_pointer_position = Some((x, y));
-                            }
-                        }
-                    }
-                })
-                .map_err(|e| {
-                    error!("vnc: failed to spawn bridge thread: {e}");
-                    DeviceManagerError::VncBridgeSpawn(std::io::Error::other(
-                        format!("failed to spawn bridge thread: {e}"),
-                    ))
-                })?;
-            self.vnc_bridge_handle = Some(bridge_handle);
-        }
-
-        self.framebuffer_surface = Some(surface);
-        self.vnc_server = Some(vnc_server);
-        self.vnc_server_handle = Some(vnc_handle);
-
         Ok(())
     }
 

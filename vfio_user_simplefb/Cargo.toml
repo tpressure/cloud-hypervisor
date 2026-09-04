@@ -1,0 +1,20 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "vfio_user_simplefb"
+version = "0.1.0"
+
+[dependencies]
+clap = { workspace = true, features = ["cargo", "wrap_help"] }
+display = { path = "../display" }
+env_logger = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+signal-hook = { workspace = true }
+thiserror = { workspace = true }
+vfio-bindings = { workspace = true }
+vfio_user = { workspace = true }
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+
+[lints]
+workspace = true

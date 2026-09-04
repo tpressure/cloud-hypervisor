@@ -2393,12 +2393,7 @@ impl DebugConsoleConfig {
 impl DisplayConfig {
     pub fn parse(display: &str) -> Result<Self> {
         if display == "off" {
-            return Ok(Self {
-                backend: DisplayBackend::Ramfb,
-                vnc: None,
-                width: 1024,
-                height: 768,
-            });
+            return Ok(Self::default());
         }
 
         let mut parser = OptionParser::new();
@@ -2407,9 +2402,12 @@ impl DisplayConfig {
             .add("vnc")
             .add("width")
             .add("height");
-        parser.parse(display).map_err(|e| Error::ParseDisplay(format!("{e}")))?;
+        parser
+            .parse(display)
+            .map_err(|e| Error::ParseDisplay(format!("{e}")))?;
 
         let mut config = Self::default();
+        config.backend = DisplayBackend::Ramfb;
 
         if let Some(vnc) = parser.get("vnc") {
             if let Some(path) = vnc.strip_prefix("unix:") {

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use log::{debug, error, info, warn};
 
-use crate::framebuffer::FramebufferSurface;
+use crate::framebuffer::FramebufferSource;
 
 const MAX_CLIENT_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
@@ -190,6 +190,22 @@ pub enum VncListener {
 }
 
 impl VncListener {
+    fn bind(config: &VncServerConfig) -> Result<Self> {
+        match &config.listener {
+            VncListenerType::Tcp { port } => {
+                let listener = TcpListener::bind(format!("0.0.0.0:{port}"))?;
+                info!("vnc: listening on TCP 0.0.0.0:{port}");
+                Ok(Self::Tcp(listener))
+            }
+            VncListenerType::Unix { path } => {
+                let _ = std::fs::remove_file(path);
+                let listener = UnixListener::bind(path)?;
+                info!("vnc: listening on Unix socket {path}");
+                Ok(Self::Unix(listener))
+            }
+        }
+    }
+
     fn accept(&self) -> Result<(VncStream, String)> {
         match self {
             VncListener::Tcp(l) => {
@@ -231,7 +247,7 @@ pub struct VncServerConfig {
 
 /// VNC server that polls the framebuffer and serves a single client.
 pub struct VncServer {
-    surface: Arc<FramebufferSurface>,
+    surface: Arc<dyn FramebufferSource>,
     config: VncServerConfig,
     input_sender: mpsc::Sender<VncInputEvent>,
     running: Arc<AtomicBool>,
@@ -240,7 +256,7 @@ pub struct VncServer {
 
 impl VncServer {
     pub fn new(
-        surface: Arc<FramebufferSurface>,
+        surface: Arc<dyn FramebufferSource>,
         config: VncServerConfig,
         input_sender: mpsc::Sender<VncInputEvent>,
     ) -> Self {
@@ -262,7 +278,7 @@ impl VncServer {
 
     pub fn spawn(&self) -> std::io::Result<thread::JoinHandle<()>> {
         let surface = Arc::clone(&self.surface);
-        let config = self.config.clone();
+        let listener = VncListener::bind(&self.config)?;
         let input_sender = self.input_sender.clone();
         let running = Arc::clone(&self.running);
         let on_disconnect = self
@@ -276,7 +292,7 @@ impl VncServer {
         thread::Builder::new()
             .name("ch-vnc-server".to_string())
             .spawn(move || {
-                run_vnc_server(surface, config, input_sender, running, on_disconnect);
+                run_vnc_server(surface, listener, input_sender, running, on_disconnect);
             })
             .map_err(|e| {
                 error!("vnc: failed to spawn server thread: {e}");
@@ -290,38 +306,12 @@ impl VncServer {
 }
 
 fn run_vnc_server(
-    surface: Arc<FramebufferSurface>,
-    config: VncServerConfig,
+    surface: Arc<dyn FramebufferSource>,
+    listener: VncListener,
     input_sender: mpsc::Sender<VncInputEvent>,
     running: Arc<AtomicBool>,
     on_disconnect: Option<Box<dyn Fn() + Send>>,
 ) {
-    let listener = match &config.listener {
-        VncListenerType::Tcp { port } => match TcpListener::bind(format!("0.0.0.0:{port}")) {
-            Ok(l) => {
-                info!("vnc: listening on TCP 127.0.0.1:{port}");
-                VncListener::Tcp(l)
-            }
-            Err(e) => {
-                error!("vnc: failed to bind TCP port {port}: {e}");
-                return;
-            }
-        },
-        VncListenerType::Unix { path } => {
-            let _ = std::fs::remove_file(path);
-            match UnixListener::bind(path) {
-                Ok(l) => {
-                    info!("vnc: listening on Unix socket {path}");
-                    VncListener::Unix(l)
-                }
-                Err(e) => {
-                    error!("vnc: failed to bind Unix socket {path}: {e}");
-                    return;
-                }
-            }
-        }
-    };
-
     listener.set_nonblocking(true).ok();
 
     while running.load(Ordering::SeqCst) {
@@ -362,7 +352,7 @@ fn run_vnc_server(
 
 fn handle_client(
     stream: VncStream,
-    surface: &Arc<FramebufferSurface>,
+    surface: &Arc<dyn FramebufferSource>,
     input_sender: &mpsc::Sender<VncInputEvent>,
     running: &Arc<AtomicBool>,
     on_disconnect: &Option<Box<dyn Fn() + Send>>,
@@ -377,7 +367,12 @@ fn handle_client(
         let use_rfb38 = handshake(&mut *s)?;
         security(&mut *s, use_rfb38)?;
 
-        let config = surface.config();
+        let config = surface.config().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "framebuffer DMA mapping is unavailable",
+            )
+        })?;
         let width = config.width;
         let height = config.height;
         debug!("vnc: surface config width={} height={}", width, height);
@@ -432,11 +427,7 @@ fn handle_client(
                 // Keep non-blocking. Incomplete RFB messages remain buffered until
                 // the rest of the message arrives.
                 info!("vnc: socket readable, draining input");
-                if let Err(e) =
-                    check_client_input(&mut *s, input_sender, &mut input_buffer, &mut client_state)
-                {
-                    return Err(e);
-                }
+                check_client_input(&mut *s, input_sender, &mut input_buffer, &mut client_state)?;
             }
 
             let mut fb_sent = false;
@@ -465,7 +456,12 @@ fn handle_client(
                         } && (poll_out.revents & libc::POLLOUT) != 0;
 
                         if writable {
-                            let config = surface.config();
+                            let config = surface.config().ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::NotConnected,
+                                    "framebuffer DMA mapping was removed",
+                                )
+                            })?;
                             // Framebuffer updates can be much larger than the socket send
                             // buffer, especially when sent through nova-novncproxy. The
                             // stream is normally non-blocking, so write_all() can otherwise

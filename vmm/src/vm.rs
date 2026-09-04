@@ -111,12 +111,12 @@ use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapsho
 ))]
 use crate::sev::MeasuredBootInfo;
 use crate::vcpu_throttling::ThrottleThreadHandle;
-#[cfg(feature = "fw_cfg")]
-use crate::vm_config::FwCfgConfig;
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
     NumaConfig, PayloadConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
+#[cfg(feature = "fw_cfg")]
+use crate::vm_config::{DisplayBackend, FwCfgConfig};
 use crate::{
     CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, GuestMemoryMmap,
     MEMORY_MANAGER_SNAPSHOT_ID, PciDeviceInfo, cpu,
@@ -1007,8 +1007,7 @@ impl Vm {
             .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
             .map_err(Error::CpuManager)?;
 
-        // Create fw_cfg device BEFORE KVM/MSHV init so that create_display()
-        // inside create_devices() can wire the RAMFB callback.
+        // Create fw_cfg before KVM/MSHV initialization so firmware can use it.
         #[cfg(feature = "fw_cfg")]
         Self::create_fw_cfg_if_enabled(config, device_manager)?;
 
@@ -1186,9 +1185,9 @@ impl Vm {
                 .as_ref()
                 .is_some_and(|p| p.fw_cfg_config.is_some());
 
-            // Also enable fw_cfg when display (RAMFB VNC) is configured,
+            // Also enable fw_cfg when the firmware RAMFB is configured,
             // since QemuRamfbDxe requires fw_cfg to discover framebuffer parameters.
-            let display_needs_fw_cfg = cfg.display.vnc.is_some();
+            let display_needs_fw_cfg = cfg.display.backend == DisplayBackend::Ramfb;
 
             fw_cfg_enabled || display_needs_fw_cfg
         };

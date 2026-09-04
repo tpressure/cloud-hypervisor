@@ -5,9 +5,5 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-anyhow = { workspace = true }
-byteorder = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-thiserror = { workspace = true }
-vm-memory = { workspace = true, features = ["backend-atomic", "backend-mmap", "backend-bitmap"] }

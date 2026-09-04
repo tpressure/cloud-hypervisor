@@ -715,12 +715,8 @@ dependencies = [
 name = "display"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "byteorder",
  "libc",
  "log",
- "thiserror",
- "vm-memory",
 ]
 
 [[package]]
@@ -2660,6 +2656,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vfio_user_simplefb"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "display",
+ "env_logger",
+ "libc",
+ "log",
+ "signal-hook",
+ "thiserror",
+ "vfio-bindings",
+ "vfio_user",
+ "vm-memory",
+]
+
+[[package]]
 name = "vhost"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2853,7 +2865,6 @@ dependencies = [
  "clap",
  "devices",
  "dhat",
- "display",
  "epoll",
  "event_monitor",
  "flume",

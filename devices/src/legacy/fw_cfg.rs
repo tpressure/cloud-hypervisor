@@ -16,7 +16,7 @@ use std::{
     io::{ErrorKind, Read, Result, Seek, SeekFrom},
     mem::offset_of,
     os::unix::fs::FileExt,
-    sync::{Arc, Barrier, Mutex},
+    sync::{Arc, Barrier},
 };
 
 use acpi_tables::rsdp::Rsdp;
@@ -176,9 +176,6 @@ impl FwCfgContent {
     }
 }
 
-/// Callback type for handling writes to the `etc/ramfb` fw_cfg item.
-type RamfbWriteCallback = Arc<Mutex<dyn Fn(&[u8]) + Send + Sync>>;
-
 #[derive(Debug, Default)]
 pub struct FwCfgItem {
     pub name: String,
@@ -197,7 +194,6 @@ pub struct FwCfg {
     items: Vec<FwCfgItem>,                           // 0x20 and above
     known_items: [FwCfgContent; FW_CFG_KNOWN_ITEMS], // 0x0 to 0x19
     memory: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
-    ramfb_write_callback: Option<RamfbWriteCallback>,
 }
 
 impl std::fmt::Debug for FwCfg {
@@ -507,12 +503,7 @@ impl FwCfg {
             ],
             known_items,
             memory,
-            ramfb_write_callback: None,
         }
-    }
-
-    pub fn set_ramfb_write_callback(&mut self, callback: RamfbWriteCallback) {
-        self.ramfb_write_callback = Some(callback);
     }
 
     pub fn populate_fw_cfg(
@@ -712,12 +703,6 @@ impl FwCfg {
                         "fw_cfg: dma_write copied {} bytes at offset {}, total={}",
                         buf.len(), start, bytes.len()
                     );
-                    if let Some(ref callback) = self.ramfb_write_callback {
-                        callback.lock().unwrap()(bytes);
-                        debug!("fw_cfg: ramfb callback invoked");
-                    } else {
-                        debug!("fw_cfg: ramfb callback is None!");
-                    }
                     self.data_offset += len;
                     return Ok(());
                 }

@@ -32,7 +32,7 @@ use vmm::vm_config::FwCfgConfig;
 #[cfg(feature = "ivshmem")]
 use vmm::vm_config::IvshmemConfig;
 use vmm::vm_config::{
-    BalloonConfig, ConsoleConfig, DeviceConfig, DisplayConfig, DiskConfig, FsConfig,
+    BalloonConfig, ConsoleConfig, DeviceConfig, DiskConfig, DisplayConfig, FsConfig,
     GenericVhostUserConfig, LandlockConfig, NetConfig, NumaConfig, PciSegmentConfig,
     PlatformConfig, PmemConfig, RateLimiterGroupConfig, RngConfig, SerialConfig, TpmConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
@@ -2043,6 +2043,19 @@ mod unit_tests {
     #[test]
     fn test_valid_vm_config_display() {
         [
+            (
+                vec![
+                    "cloud-hypervisor",
+                    "--kernel",
+                    "/path/to/kernel",
+                    "--display",
+                    "ramfb",
+                ],
+                r#"{
+                    "payload": {"kernel": "/path/to/kernel"},
+                    "display": {"backend": "ramfb"}
+                }"#,
+            ),
             (
                 vec![
                     "cloud-hypervisor",
