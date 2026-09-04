@@ -13,6 +13,9 @@ The `--user-device socket=<path>` parameter is used to create a vfio-user device
 For the external firmware-framebuffer/VNC transport, see
 [External RAMFB VNC backend](vfio-user-simplefb.md).
 
+For its separate standard USB keyboard and mouse device, see
+[External vfio-user USB HID input](vfio-usb-hid.md).
+
 ## Example (GPIO device)
 
 There is a simple GPIO device included in the libvfio-user repository: https://github.com/nutanix/libvfio-user#gpio

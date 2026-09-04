@@ -43,15 +43,15 @@ and 4 GiB VM layout.
 
 ## Build and run
 
-Build both processes:
+Build both external devices and Cloud Hypervisor:
 
 ```bash
-cargo build --release -p vfio_user_simplefb
+cargo build --release -p vfio-usb-hid -p vfio_user_simplefb
 cargo build --release -p cloud-hypervisor --features kvm,fw_cfg
 ```
 
-The convenience script launches the endpoint first, waits for its vfio-user
-socket, and then launches Cloud Hypervisor:
+The convenience script launches the USB HID and framebuffer endpoints first,
+waits for their sockets, and then launches Cloud Hypervisor:
 
 ```bash
 ./run_ramfb.sh
@@ -62,6 +62,7 @@ The equivalent daemon command is:
 ```bash
 target/release/vfio_user_simplefb \
     --socket /tmp/ch-vm.simplefb.sock \
+    --input-socket /tmp/ch-vm.input.sock \
     --fb-gpa 0xBEB00000 \
     --width 1024 \
     --height 768 \
@@ -85,8 +86,12 @@ target/release/cloud-hypervisor \
     --seccomp log \
     --api-socket /tmp/ch-api.sock \
     --display ramfb \
-    --user-device socket=/tmp/ch-vm.simplefb.sock,id=simplefb-transport
+    --user-device socket=/tmp/ch-vm.simplefb.sock,id=simplefb-transport \
+    --user-device socket=/tmp/ch-vm.usb-hid.sock,id=usb-hid
 ```
+
+See [External vfio-user USB HID input](vfio-usb-hid.md) for the separate UHCI
+device, host-input socket, and guest discovery details.
 
 Use `--checksum-interval-ms 1000` on the daemon for a memory-visibility test.
 Changing checksums prove that firmware or the guest is updating the directly
@@ -134,10 +139,8 @@ Windows:
 - Framebuffer geometry is explicit daemon configuration. A firmware or guest
   GOP mode change is not discovered automatically, so width, height, stride,
   and format must match the active firmware mode.
-- VNC input is not forwarded. The old server called the in-process i8042 model
-  directly, and Cloud Hypervisor has no external input API to reuse. Input must
-  be added through a separate, existing-or-generic input transport rather than
-  graphics registers on the vfio-user function.
+- VNC input is forwarded over a separate host-only Unix socket to
+  `vfio-usb-hid`; the framebuffer PCI function contains no input registers.
 - The server accepts one Cloud Hypervisor connection per process lifetime and
   one VNC client at a time.
 - The inherited VNC backend has no authentication. Prefer the Unix listener;

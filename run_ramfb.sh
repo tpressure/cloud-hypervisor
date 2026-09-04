@@ -14,6 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CH_BIN="${SCRIPT_DIR}/target/release/cloud-hypervisor"
 FB_DAEMON="${SCRIPT_DIR}/target/release/vfio_user_simplefb"
+USB_DAEMON="${SCRIPT_DIR}/target/release/vfio-usb-hid"
 
 # Use EDK2 firmware built from gardenlinux branch (has QemuRamfbDxe + QemuFwCfgLib).
 # Falls back to CLOUDHV.fd in repo root if the build artifact is not present.
@@ -36,6 +37,8 @@ DISK="${SCRIPT_DIR}/oracular-server-cloudimg-amd64.raw"
 CLOUDINIT="/tmp/ubuntu-cloudinit.img"
 VNC_SOCKET="/tmp/ch-vm.vnc.sock"
 VFIO_USER_SOCKET="/tmp/ch-vm.simplefb.sock"
+USB_VFIO_USER_SOCKET="/tmp/ch-vm.usb-hid.sock"
+INPUT_SOCKET="/tmp/ch-vm.input.sock"
 API_SOCKET="/tmp/ch-api.sock"
 
 # Default VNC display parameters (can be overridden by firmware)
@@ -98,13 +101,36 @@ if [ ! -f "$FB_DAEMON" ]; then
     exit 1
 fi
 
+if [ ! -f "$USB_DAEMON" ]; then
+    echo "Error: vfio-usb-hid binary not found at $USB_DAEMON"
+    echo "Run: cargo build --release -p vfio-usb-hid"
+    exit 1
+fi
+
 if [ ! -f "$DISK" ]; then
     echo "Error: Disk image not found at $DISK"
     exit 1
 fi
 
 # Clean up stale sockets
-rm -f "$VNC_SOCKET" "$VFIO_USER_SOCKET" "$API_SOCKET"
+rm -f "$VNC_SOCKET" "$VFIO_USER_SOCKET" "$USB_VFIO_USER_SOCKET" "$INPUT_SOCKET" "$API_SOCKET"
+
+cleanup() {
+    if [ -n "${VIEWER_PID:-}" ]; then
+        kill "$VIEWER_PID" 2>/dev/null || true
+        wait "$VIEWER_PID" 2>/dev/null || true
+    fi
+    if [ -n "${FB_DAEMON_PID:-}" ]; then
+        kill "$FB_DAEMON_PID" 2>/dev/null || true
+        wait "$FB_DAEMON_PID" 2>/dev/null || true
+    fi
+    if [ -n "${USB_DAEMON_PID:-}" ]; then
+        kill "$USB_DAEMON_PID" 2>/dev/null || true
+        wait "$USB_DAEMON_PID" 2>/dev/null || true
+    fi
+    rm -f "$VNC_SOCKET" "$VFIO_USER_SOCKET" "$USB_VFIO_USER_SOCKET" "$INPUT_SOCKET" "$API_SOCKET"
+}
+trap cleanup EXIT INT TERM
 
 echo "=== Cloud Hypervisor RAMFB VNC ==="
 echo "Firmware:   $FIRMWARE"
@@ -119,11 +145,36 @@ echo "  vncviewer ${VNC_VIEWER_TARGET}"
 echo ""
 echo "Note: --display ramfb enables fw_cfg for QemuRamfbDxe."
 echo ""
+echo "Starting external USB HID daemon..."
+echo ""
+
+"$USB_DAEMON" \
+    --socket "$USB_VFIO_USER_SOCKET" \
+    --input-socket "$INPUT_SOCKET" &
+USB_DAEMON_PID=$!
+
+for _ in $(seq 1 50); do
+    if [ -S "$USB_VFIO_USER_SOCKET" ] && [ -S "$INPUT_SOCKET" ]; then
+        break
+    fi
+    if ! kill -0 "$USB_DAEMON_PID" 2>/dev/null; then
+        echo "Error: vfio-usb-hid exited before creating its sockets"
+        exit 1
+    fi
+    sleep 0.1
+done
+
+if [ ! -S "$USB_VFIO_USER_SOCKET" ] || [ ! -S "$INPUT_SOCKET" ]; then
+    echo "Error: timed out waiting for vfio-usb-hid sockets"
+    exit 1
+fi
+
 echo "Starting external framebuffer daemon..."
 echo ""
 
 "$FB_DAEMON" \
     --socket "$VFIO_USER_SOCKET" \
+    --input-socket "$INPUT_SOCKET" \
     --fb-gpa "$FB_GPA" \
     --width "$VNC_WIDTH" \
     --height "$VNC_HEIGHT" \
@@ -131,17 +182,6 @@ echo ""
     --format xrgb8888 \
     --vnc "$VNC_MODE" &
 FB_DAEMON_PID=$!
-
-cleanup() {
-    if [ -n "${VIEWER_PID:-}" ]; then
-        kill "$VIEWER_PID" 2>/dev/null || true
-        wait "$VIEWER_PID" 2>/dev/null || true
-    fi
-    kill "$FB_DAEMON_PID" 2>/dev/null || true
-    wait "$FB_DAEMON_PID" 2>/dev/null || true
-    rm -f "$VNC_SOCKET" "$VFIO_USER_SOCKET" "$API_SOCKET"
-}
-trap cleanup EXIT INT TERM
 
 for _ in $(seq 1 50); do
     if [ -S "$VFIO_USER_SOCKET" ]; then
@@ -180,4 +220,5 @@ echo ""
     --seccomp log \
     --api-socket "$API_SOCKET" \
     --display ramfb \
-    --user-device "socket=${VFIO_USER_SOCKET},id=simplefb-transport"
+    --user-device "socket=${VFIO_USER_SOCKET},id=simplefb-transport" \
+    --user-device "socket=${USB_VFIO_USER_SOCKET},id=usb-hid"
