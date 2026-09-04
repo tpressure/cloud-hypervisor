@@ -127,6 +127,7 @@ pub enum VncInputEvent {
     MouseButton { button: u8, down: bool },
     PointerMove { dx: i16, dy: i16 },
     PointerPosition { x: u32, y: u32 },
+    ReleaseAll,
 }
 
 /// Unified stream type for TCP and Unix sockets
@@ -338,6 +339,10 @@ fn run_vnc_server(
                     Ok(()) => info!("vnc: client disconnected from {peer}"),
                     Err(e) => warn!("vnc: handle_client error from {peer}: {e}"),
                 }
+                let _ = input_sender.send(VncInputEvent::ReleaseAll);
+                if let Some(callback) = &on_disconnect {
+                    callback();
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(100));
@@ -355,7 +360,7 @@ fn handle_client(
     surface: &Arc<dyn FramebufferSource>,
     input_sender: &mpsc::Sender<VncInputEvent>,
     running: &Arc<AtomicBool>,
-    on_disconnect: &Option<Box<dyn Fn() + Send>>,
+    _on_disconnect: &Option<Box<dyn Fn() + Send>>,
 ) -> Result<()> {
     let stream = Arc::new(Mutex::new(stream));
 
@@ -505,10 +510,6 @@ fn handle_client(
         }; // drop lock
 
         thread::sleep(sleep_duration);
-    }
-
-    if let Some(cb) = on_disconnect {
-        cb();
     }
 
     Ok(())
@@ -916,7 +917,7 @@ fn handle_client_message(
             let y = u16::from_be_bytes([message[4], message[5]]) as u32;
 
             let changed_buttons = client_state.pointer_button_mask ^ mask;
-            for (bit, button) in [(1, 0), (2, 1), (4, 2)] {
+            for (bit, button) in [(1, 0), (2, 1), (4, 2), (8, 3), (16, 4)] {
                 if changed_buttons & bit != 0 {
                     let _ = input_sender.send(VncInputEvent::MouseButton {
                         button,

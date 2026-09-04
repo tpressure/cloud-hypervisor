@@ -16,6 +16,7 @@ use log::{info, warn};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use vfio_user::Server;
+use vfio_user_simplefb::input::InputBridge;
 use vfio_user_simplefb::{
     DmaFramebuffer, FramebufferGeometry, MinimalPciBackend, framebuffer_checksum,
 };
@@ -129,6 +130,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .required(true),
         )
         .arg(
+            Arg::new("input-socket")
+                .long("input-socket")
+                .value_name("PATH")
+                .help("vfio-usb-hid host input Unix socket")
+                .required(true),
+        )
+        .arg(
             Arg::new("checksum-interval-ms")
                 .long("checksum-interval-ms")
                 .value_parser(clap::value_parser!(u64))
@@ -148,15 +156,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     );
     let fourcc = *matches.get_one::<u32>("format").unwrap();
     let vnc_listener = matches.get_one::<VncListenerType>("vnc").unwrap().clone();
+    let input_socket = PathBuf::from(matches.get_one::<String>("input-socket").unwrap());
     let checksum_interval = *matches.get_one::<u64>("checksum-interval-ms").unwrap();
 
     let geometry = FramebufferGeometry::new(gpa, width, height, stride, fourcc)?;
     let framebuffer = DmaFramebuffer::new(geometry);
     let surface: Arc<dyn FramebufferSource> = Arc::new(framebuffer.clone());
     let (input_sender, input_receiver) = mpsc::channel();
-    // Input needs a separate external transport. Disconnect this channel so
-    // unhandled VNC input cannot accumulate in an unbounded queue.
-    drop(input_receiver);
+    let input_bridge = InputBridge::spawn(input_socket, input_receiver)?;
     let vnc_server = VncServer::new(
         Arc::clone(&surface),
         VncServerConfig {
@@ -254,6 +261,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Some(handle) = checksum_handle {
         let _ = handle.join();
     }
+    input_bridge.stop();
     result.map_err(Into::into)
 }
 

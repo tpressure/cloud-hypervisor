@@ -2,9 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod input;
+
 use std::fs::File;
 use std::io;
-use std::sync::{Arc, RwLock};
 
 use display::framebuffer::FramebufferSource;
 use display::ramfb::{DRM_FORMAT_XRGB8888, RamfbConfig};
@@ -12,7 +13,7 @@ use log::{info, warn};
 use thiserror::Error;
 use vfio_bindings::bindings::vfio::{VFIO_PCI_CONFIG_REGION_INDEX, vfio_region_info};
 use vfio_user::{DmaMapFlags, DmaUnmapFlags, IrqInfo, ServerBackend, ServerRegion};
-use vm_memory::{FileOffset, MmapRegion};
+use vfio_user_common::guest_memory::{GuestAddress, GuestMemoryMap};
 
 pub const PCI_VENDOR_ID: u16 = 0x1b36;
 // Prototype device ID in the Red Hat/QEMU virtual-device vendor namespace.
@@ -132,27 +133,17 @@ pub fn mapping_covers_framebuffer(
     Ok(mapping.readable && mapping.iova <= framebuffer_gpa && framebuffer_end <= mapping_end)
 }
 
-struct DmaMapping {
-    range: MappingRange,
-    memory: MmapRegion,
-}
-
-#[derive(Default)]
-struct MappingState {
-    mappings: Vec<Arc<DmaMapping>>,
-}
-
 #[derive(Clone)]
 pub struct DmaFramebuffer {
     geometry: FramebufferGeometry,
-    state: Arc<RwLock<MappingState>>,
+    memory: GuestMemoryMap,
 }
 
 impl DmaFramebuffer {
     pub fn new(geometry: FramebufferGeometry) -> Self {
         Self {
             geometry,
-            state: Arc::new(RwLock::new(MappingState::default())),
+            memory: GuestMemoryMap::new(),
         }
     }
 
@@ -161,17 +152,18 @@ impl DmaFramebuffer {
     }
 
     pub fn mapping_count(&self) -> usize {
-        self.state.read().unwrap().mappings.len()
+        self.memory.mapping_count()
     }
 
     pub fn has_framebuffer_mapping(&self) -> bool {
-        let state = self.state.read().unwrap();
-        Self::covering_mapping(&state, self.geometry).is_some()
+        let Ok(size) = usize::try_from(self.geometry.size) else {
+            return false;
+        };
+        self.memory.contains(GuestAddress(self.geometry.gpa), size)
     }
 
     pub fn clear_mappings(&self) {
-        let mut state = self.state.write().unwrap();
-        state.mappings.clear();
+        self.memory.clear();
     }
 
     fn add_mapping(
@@ -192,41 +184,14 @@ impl DmaFramebuffer {
             io::Error::new(io::ErrorKind::InvalidInput, "DMA mapping range overflows")
         })?;
 
-        let file = file.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "DMA mapping has no shared-memory file descriptor; use --memory shared=on",
-            )
-        })?;
-        let size_usize = usize::try_from(size).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "DMA mapping does not fit the host address space",
-            )
-        })?;
         let readable = flags.contains(DmaMapFlags::READ);
         let writable = flags.contains(DmaMapFlags::WRITE);
-        let mut prot = 0;
-        if readable {
-            prot |= libc::PROT_READ;
-        }
-        if writable {
-            prot |= libc::PROT_WRITE;
-        }
         if !readable {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "DMA mapping is not readable",
             ));
         }
-
-        let memory = MmapRegion::build(
-            Some(FileOffset::new(file, offset)),
-            size_usize,
-            prot,
-            libc::MAP_SHARED,
-        )
-        .map_err(|error| io::Error::other(format!("cannot mmap shared guest RAM: {error}")))?;
 
         let range = MappingRange {
             iova,
@@ -242,76 +207,37 @@ impl DmaFramebuffer {
             if covers { "yes" } else { "no" },
         );
 
-        let mut state = self.state.write().unwrap();
-        state.mappings.push(Arc::new(DmaMapping { range, memory }));
-        Ok(())
+        self.memory
+            .map(flags, offset, GuestAddress(iova), size, file)
     }
 
     fn remove_mapping(&self, flags: DmaUnmapFlags, iova: u64, size: u64) -> io::Result<()> {
-        let mut state = self.state.write().unwrap();
-        if flags.contains(DmaUnmapFlags::UNMAP_ALL) {
-            info!("DMA_UNMAP all mappings");
-            state.mappings.clear();
-            return Ok(());
-        }
-
-        let unmap_end = iova.checked_add(size).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "DMA unmap range overflows")
-        })?;
-        let before = state.mappings.len();
-        state.mappings.retain(|mapping| {
-            let Some(mapping_end) = mapping.range.iova.checked_add(mapping.range.size) else {
-                return false;
-            };
-            let overlaps = iova < mapping_end && mapping.range.iova < unmap_end;
-            if overlaps && (iova != mapping.range.iova || size != mapping.range.size) {
-                warn!(
-                    "partial DMA_UNMAP invalidates complete mapping iova=0x{:x} size=0x{:x}",
-                    mapping.range.iova, mapping.range.size
-                );
-            }
-            !overlaps
-        });
-        info!(
-            "DMA_UNMAP iova=0x{iova:016x} size=0x{size:x} removed={}",
-            before - state.mappings.len()
-        );
-        Ok(())
+        self.memory
+            .unmap(flags, GuestAddress(iova), size)
+            .map(|_| ())
     }
 
-    fn covering_mapping(
-        state: &MappingState,
-        geometry: FramebufferGeometry,
-    ) -> Option<Arc<DmaMapping>> {
-        state
-            .mappings
-            .iter()
-            .find(|mapping| {
-                mapping_covers_framebuffer(mapping.range, geometry.gpa, geometry.size)
-                    .unwrap_or(false)
-            })
-            .cloned()
+    fn read_pixels(&self) -> io::Result<Vec<u8>> {
+        let size = usize::try_from(self.geometry.size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "framebuffer size does not fit the host address space",
+            )
+        })?;
+        self.memory
+            .read_vec(GuestAddress(self.geometry.gpa), size)
+            .inspect_err(|error| warn!("cannot read mapped framebuffer: {error}"))
     }
 }
 
 impl FramebufferSource for DmaFramebuffer {
     fn config(&self) -> Option<RamfbConfig> {
-        let state = self.state.read().unwrap();
-        Self::covering_mapping(&state, self.geometry).map(|_| self.geometry.ramfb_config())
+        self.has_framebuffer_mapping()
+            .then(|| self.geometry.ramfb_config())
     }
 
     fn read_framebuffer(&self) -> Option<Vec<u8>> {
-        let state = self.state.read().unwrap();
-        let mapping = Self::covering_mapping(&state, self.geometry)?;
-        let offset = usize::try_from(self.geometry.gpa.checked_sub(mapping.range.iova)?).ok()?;
-        let size = usize::try_from(self.geometry.size).ok()?;
-
-        // SAFETY: Mapping containment was checked above, `offset + size` is
-        // within the live MmapRegion, and the read lock prevents DMA_UNMAP
-        // from dropping that region until the owned snapshot is complete.
-        let pixels =
-            unsafe { std::slice::from_raw_parts(mapping.memory.as_ptr().add(offset), size) };
-        Some(pixels.to_vec())
+        self.read_pixels().ok()
     }
 }
 
@@ -471,9 +397,7 @@ pub fn framebuffer_checksum(data: &[u8]) -> u64 {
 mod tests {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
-    use std::sync::Barrier;
     use std::thread;
-    use std::time::Duration;
 
     use super::*;
 
@@ -582,9 +506,9 @@ mod tests {
         framebuffer
             .add_mapping(
                 DmaMapFlags::READ_WRITE,
-                0,
-                0,
-                0x4000,
+                0x1000,
+                0x1000,
+                0x3000,
                 Some(temp_file(0x4000)),
             )
             .unwrap();
@@ -594,36 +518,6 @@ mod tests {
             framebuffer.read_framebuffer().unwrap(),
             vec![0x5a; FB_SIZE as usize]
         );
-    }
-
-    #[test]
-    fn unmap_invalidates_framebuffer_after_active_read() {
-        let framebuffer = test_framebuffer();
-        framebuffer
-            .add_mapping(
-                DmaMapFlags::READ_WRITE,
-                0,
-                0,
-                0x4000,
-                Some(temp_file(0x4000)),
-            )
-            .unwrap();
-
-        let barrier = Arc::new(Barrier::new(2));
-        let state = Arc::clone(&framebuffer.state);
-        let held_barrier = Arc::clone(&barrier);
-        let reader = thread::spawn(move || {
-            let _guard = state.read().unwrap();
-            held_barrier.wait();
-            thread::sleep(Duration::from_millis(50));
-        });
-        barrier.wait();
-
-        framebuffer
-            .remove_mapping(DmaUnmapFlags::empty(), 0, 0x4000)
-            .unwrap();
-        reader.join().unwrap();
-        assert!(framebuffer.read_framebuffer().is_none());
     }
 
     #[test]
