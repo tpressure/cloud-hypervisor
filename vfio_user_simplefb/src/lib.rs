@@ -15,10 +15,15 @@ use vfio_user::{DmaMapFlags, DmaUnmapFlags, IrqInfo, ServerBackend, ServerRegion
 use vm_memory::{FileOffset, MmapRegion};
 
 pub const PCI_VENDOR_ID: u16 = 0x1b36;
-pub const PCI_DEVICE_ID: u16 = 0x0010;
+// Prototype device ID in the Red Hat/QEMU virtual-device vendor namespace.
+// This value is intentionally not a registered QEMU device model ID.
+pub const PCI_DEVICE_ID: u16 = 0x00ff;
 pub const PCI_CONFIG_SPACE_SIZE: usize = 4096;
 pub const PCI_REGION_COUNT: usize = VFIO_PCI_CONFIG_REGION_INDEX as usize + 1;
 pub const FRAMEBUFFER_BYTES_PER_PIXEL: u32 = 4;
+
+const PCI_BAR_RANGE: std::ops::Range<usize> = 0x10..0x28;
+const PCI_ROM_ADDRESS_RANGE: std::ops::Range<usize> = 0x30..0x34;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FramebufferGeometry {
@@ -318,15 +323,26 @@ pub struct MinimalPciBackend {
 impl MinimalPciBackend {
     pub fn new(framebuffer: DmaFramebuffer) -> Self {
         let mut config = [0u8; PCI_CONFIG_SPACE_SIZE];
-        config[0..2].copy_from_slice(&PCI_VENDOR_ID.to_le_bytes());
-        config[2..4].copy_from_slice(&PCI_DEVICE_ID.to_le_bytes());
-        // An unclassified PCI function is intentionally harmless: it exists
-        // only to establish the vfio-user DMA mapping transport.
-        config[0x0b] = 0xff;
+        Self::restore_static_config(&mut config);
         Self {
             config,
             framebuffer,
         }
+    }
+
+    fn restore_static_config(config: &mut [u8; PCI_CONFIG_SPACE_SIZE]) {
+        config[0..2].copy_from_slice(&PCI_VENDOR_ID.to_le_bytes());
+        config[2..4].copy_from_slice(&PCI_DEVICE_ID.to_le_bytes());
+        // An unclassified PCI function is intentionally harmless: it exists
+        // only to establish the vfio-user DMA mapping transport.
+        config[0x08..0x0c].copy_from_slice(&[0, 0, 0, 0xff]);
+        config[0x0e] = 0;
+
+        // BARs and the expansion ROM are not implemented. PCI sizing probes
+        // write all ones, so these fields must be restored to zero rather than
+        // echoing the probe value back to Cloud Hypervisor.
+        config[PCI_BAR_RANGE].fill(0);
+        config[PCI_ROM_ADDRESS_RANGE].fill(0);
     }
 
     pub fn regions() -> Vec<ServerRegion> {
@@ -405,10 +421,7 @@ impl ServerBackend for MinimalPciBackend {
         }
         let range = Self::checked_config_range(offset, data.len())?;
         self.config[range].copy_from_slice(data);
-        // Keep identity and class fields immutable.
-        self.config[0..2].copy_from_slice(&PCI_VENDOR_ID.to_le_bytes());
-        self.config[2..4].copy_from_slice(&PCI_DEVICE_ID.to_le_bytes());
-        self.config[0x0b] = 0xff;
+        Self::restore_static_config(&mut self.config);
         Ok(())
     }
 
@@ -630,5 +643,54 @@ mod tests {
             .unwrap();
         assert_eq!(framebuffer.mapping_count(), 0);
         assert!(framebuffer.read_framebuffer().is_none());
+    }
+
+    #[test]
+    fn pci_identity_and_absent_regions_are_hard_wired() {
+        let mut backend = MinimalPciBackend::new(test_framebuffer());
+
+        backend
+            .region_write(VFIO_PCI_CONFIG_REGION_INDEX, 0, &[0; 4])
+            .unwrap();
+        let mut identity = [0; 4];
+        backend
+            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, 0, &mut identity)
+            .unwrap();
+        assert_eq!(
+            identity,
+            [
+                PCI_VENDOR_ID.to_le_bytes()[0],
+                PCI_VENDOR_ID.to_le_bytes()[1],
+                PCI_DEVICE_ID.to_le_bytes()[0],
+                PCI_DEVICE_ID.to_le_bytes()[1],
+            ]
+        );
+
+        backend
+            .region_write(VFIO_PCI_CONFIG_REGION_INDEX, 0x10, &[0xff; 0x18])
+            .unwrap();
+        let mut bars = [0xff; 0x18];
+        backend
+            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, 0x10, &mut bars)
+            .unwrap();
+        assert_eq!(bars, [0; 0x18]);
+
+        backend
+            .region_write(VFIO_PCI_CONFIG_REGION_INDEX, 0x30, &[0xff; 4])
+            .unwrap();
+        let mut rom = [0xff; 4];
+        backend
+            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, 0x30, &mut rom)
+            .unwrap();
+        assert_eq!(rom, [0; 4]);
+
+        backend
+            .region_write(VFIO_PCI_CONFIG_REGION_INDEX, 4, &[7, 0])
+            .unwrap();
+        let mut command = [0; 2];
+        backend
+            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, 4, &mut command)
+            .unwrap();
+        assert_eq!(command, [7, 0]);
     }
 }

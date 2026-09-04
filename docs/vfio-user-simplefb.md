@@ -5,6 +5,11 @@ separate from Cloud Hypervisor. The vfio-user PCI function is only a transport
 endpoint which causes Cloud Hypervisor to export shared guest RAM. It has no
 BARs, interrupts, display registers, or guest driver.
 
+The prototype endpoint uses PCI ID `1b36:00ff`, an unregistered device ID in
+the Red Hat/QEMU virtual-device namespace. It deliberately avoids IDs belonging
+to real QEMU device models and should be replaced by an assigned ID before any
+production use.
+
 The guest-visible display remains EDK2 `QemuRamfbDxe` and UEFI GOP. Linux and
 Windows continue to use their firmware framebuffer paths.
 
