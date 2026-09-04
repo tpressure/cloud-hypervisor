@@ -4,6 +4,8 @@
 
 use std::collections::{BTreeSet, VecDeque};
 
+use log::{debug, info};
+
 use crate::usb::control::{
     ControlDevice, ControlEndpoint, ControlResponse, HID_GET_IDLE, HID_GET_PROTOCOL,
     HID_GET_REPORT, HID_SET_IDLE, HID_SET_PROTOCOL, HID_SET_REPORT, REQUEST_CLEAR_FEATURE,
@@ -164,6 +166,7 @@ impl UsbDevice for HidKeyboard {
             (0, _) => self.control_packet(pid, data, max_length),
             (1, UsbPid::In) if self.configuration != 0 => {
                 self.next_report().map_or(UsbPacketResult::Nak, |report| {
+                    debug!("USB HID keyboard report: {report:02x?}");
                     UsbPacketResult::Success(report[..max_length.min(report.len())].to_vec())
                 })
             }
@@ -222,6 +225,9 @@ impl ControlDevice for HidKeyboard {
                 true
             }
             (REQUEST_TYPE_STANDARD, REQUEST_SET_CONFIGURATION) if setup.value <= 1 => {
+                if self.configuration == 0 && setup.value == 1 {
+                    info!("USB HID keyboard configured");
+                }
                 self.configuration = setup.value as u8;
                 true
             }

@@ -2,6 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::VecDeque;
+
+use log::{debug, info};
+
 use crate::usb::control::{
     ControlDevice, ControlEndpoint, ControlResponse, HID_GET_IDLE, HID_GET_PROTOCOL,
     HID_GET_REPORT, HID_SET_IDLE, HID_SET_PROTOCOL, REQUEST_CLEAR_FEATURE,
@@ -24,6 +28,7 @@ pub const REPORT_DESCRIPTOR: &[u8] = &[
 
 const PRODUCT_ID: u16 = 0x0101;
 const PROTOCOL_REPORT: u8 = 1;
+const MAX_BUTTON_REPORTS: usize = 64;
 
 pub struct HidMouse {
     address: u8,
@@ -31,10 +36,11 @@ pub struct HidMouse {
     protocol: u8,
     idle: u8,
     buttons: u8,
+    reported_buttons: u8,
+    button_reports: VecDeque<u8>,
     pending_dx: i64,
     pending_dy: i64,
     pending_wheel: i64,
-    dirty: bool,
     control: ControlEndpoint,
 }
 
@@ -46,10 +52,11 @@ impl HidMouse {
             protocol: PROTOCOL_REPORT,
             idle: 0,
             buttons: 0,
+            reported_buttons: 0,
+            button_reports: VecDeque::new(),
             pending_dx: 0,
             pending_dy: 0,
             pending_wheel: 0,
-            dirty: false,
             control: ControlEndpoint::new(),
         }
     }
@@ -59,29 +66,47 @@ impl HidMouse {
         self.pending_dy = self.pending_dy.saturating_add(i64::from(dy));
         self.pending_wheel = self.pending_wheel.saturating_add(i64::from(wheel));
         let buttons = buttons & 0x07;
-        self.dirty |= dx != 0 || dy != 0 || wheel != 0 || self.buttons != buttons;
-        self.buttons = buttons;
+        if self.buttons != buttons {
+            self.buttons = buttons;
+            let queued_buttons = self
+                .button_reports
+                .back()
+                .copied()
+                .unwrap_or(self.reported_buttons);
+            if queued_buttons != buttons {
+                if self.button_reports.len() == MAX_BUTTON_REPORTS {
+                    self.button_reports.pop_front();
+                }
+                self.button_reports.push_back(buttons);
+            }
+        }
     }
 
     pub fn release_all(&mut self) {
         self.pending_dx = 0;
         self.pending_dy = 0;
         self.pending_wheel = 0;
-        if self.buttons != 0 {
-            self.buttons = 0;
-            self.dirty = true;
+        self.buttons = 0;
+        self.button_reports.clear();
+        if self.reported_buttons != 0 {
+            self.button_reports.push_back(0);
         }
     }
 
     pub fn next_report(&mut self) -> Option<Vec<u8>> {
-        if !self.dirty {
+        if self.button_reports.is_empty()
+            && self.pending_dx == 0
+            && self.pending_dy == 0
+            && self.pending_wheel == 0
+        {
             return None;
         }
+        let buttons = self.button_reports.pop_front().unwrap_or(self.buttons);
         let dx = take_delta(&mut self.pending_dx);
         let dy = take_delta(&mut self.pending_dy);
         let wheel = take_delta(&mut self.pending_wheel);
-        self.dirty = self.pending_dx != 0 || self.pending_dy != 0 || self.pending_wheel != 0;
-        let mut report = vec![self.buttons, dx as u8, dy as u8];
+        self.reported_buttons = buttons;
+        let mut report = vec![buttons, dx as u8, dy as u8];
         if self.protocol == PROTOCOL_REPORT {
             report.push(wheel as u8);
         }
@@ -123,10 +148,14 @@ impl UsbDevice for HidMouse {
         self.protocol = PROTOCOL_REPORT;
         self.idle = 0;
         self.control.reset();
+        self.reported_buttons = 0;
+        self.button_reports.clear();
+        if self.buttons != 0 {
+            self.button_reports.push_back(self.buttons);
+        }
         self.pending_dx = 0;
         self.pending_dy = 0;
         self.pending_wheel = 0;
-        self.dirty = self.buttons != 0;
     }
 
     fn address(&self) -> u8 {
@@ -144,6 +173,7 @@ impl UsbDevice for HidMouse {
             (0, _) => self.control_packet(pid, data, max_length),
             (1, UsbPid::In) if self.configuration != 0 => {
                 self.next_report().map_or(UsbPacketResult::Nak, |report| {
+                    debug!("USB HID mouse report: {report:02x?}");
                     UsbPacketResult::Success(report[..max_length.min(report.len())].to_vec())
                 })
             }
@@ -201,6 +231,9 @@ impl ControlDevice for HidMouse {
                 true
             }
             (REQUEST_TYPE_STANDARD, REQUEST_SET_CONFIGURATION) if setup.value <= 1 => {
+                if self.configuration == 0 && setup.value == 1 {
+                    info!("USB HID mouse configured");
+                }
                 self.configuration = setup.value as u8;
                 true
             }
@@ -258,5 +291,16 @@ mod tests {
         assert_eq!(mouse.next_report().unwrap(), [1, 1, 2]);
         mouse.release_all();
         assert_eq!(mouse.next_report().unwrap(), [0, 0, 0]);
+    }
+
+    #[test]
+    fn rapid_button_press_and_release_are_both_reported() {
+        let mut mouse = HidMouse::new();
+        mouse.update(0, 0, 0, 1);
+        mouse.update(0, 0, 0, 0);
+
+        assert_eq!(mouse.next_report(), Some(vec![1, 0, 0, 0]));
+        assert_eq!(mouse.next_report(), Some(vec![0, 0, 0, 0]));
+        assert_eq!(mouse.next_report(), None);
     }
 }

@@ -48,9 +48,11 @@ option. The separate host-input Unix socket is owned by `vfio-usb-hid`.
 
 ## Guest-visible controller
 
-The prototype PCI identity is `1b36:00fe`. The device ID is currently an
-unregistered value in the Red Hat/QEMU virtual-device namespace and must be
-assigned before production use. The PCI class is `0c0300`:
+The PCI identity is `8086:7020`, the well-known Intel PIIX3 UHCI identity used
+by established virtual-machine implementations. A synthetic class-correct
+identity worked with Linux, but Windows Server 2025 did not select its inbox
+UHCI driver for it. The standard identity avoids requiring a custom Windows
+driver. The PCI class remains `0c0300`:
 
 ```text
 base class    0x0c  serial bus controller
@@ -209,9 +211,21 @@ INTx path. `uhci_hcd` created a two-port bus, enumerated `1b36:0100` and
 `1b36:0101` as low-speed devices, and `hid-generic` bound them as a keyboard
 and mouse.
 
+Windows Server 2025 build 26100 loaded its inbox UHCI and HID stacks for the
+`8086:7020` identity. Runtime traces confirmed both HID devices reached the
+configured state and that Windows consumed keyboard press/release, relative
+pointer motion, and mouse-button press/release reports sent by the VNC path.
+No custom guest driver or INF was added. The class-correct synthetic controller
+identity used during initial development did not make Windows select the inbox
+UHCI driver, which is why the model uses the established PIIX3 identity.
+
+The EDK2 image used for testing allocated the PCI I/O BAR but did not enumerate
+the USB devices. That firmware build does not include an active UHCI bus driver;
+firmware input therefore remains unavailable without a differently configured
+EDK2 image.
+
 The model intentionally provides only one UHCI controller, two root ports, and
 the two fixed HID devices. It does not implement USB hubs, hotplug, bulk or
 isochronous data devices, EHCI/xHCI companion controllers, passthrough, or
-migration state. Windows and EDK2 input still require manual compatibility
-testing. The input protocol defines a keyboard-LED record, but LED state is not
-currently sent back to the VNC frontend.
+migration state. The input protocol defines a keyboard-LED record, but LED
+state is not currently sent back to the VNC frontend.

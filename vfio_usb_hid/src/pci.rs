@@ -16,10 +16,10 @@ use vfio_user::{IrqInfo, ServerRegion};
 
 use crate::uhci::UHCI_IO_BAR_SIZE;
 
-pub const PCI_VENDOR_ID: u16 = 0x1b36;
-// Prototype ID in the Red Hat/QEMU virtual-device namespace. It is not a
-// registered QEMU model ID and must be replaced before production use.
-pub const PCI_DEVICE_ID: u16 = 0x00fe;
+// Use the well-known PIIX3 UHCI identity for inbox-driver compatibility.
+// The programming model exposed here is the same standard UHCI interface.
+pub const PCI_VENDOR_ID: u16 = 0x8086;
+pub const PCI_DEVICE_ID: u16 = 0x7020;
 const PCI_CONFIG_SPACE_SIZE: usize = 4096;
 const PCI_REGION_COUNT: usize = VFIO_PCI_CONFIG_REGION_INDEX as usize + 1;
 const UHCI_BAR_OFFSET: usize = 0x20;
@@ -161,7 +161,7 @@ mod tests {
         let mut config = PciConfig::new();
         let mut data = [0; 4];
         config.read(0, &mut data).unwrap();
-        assert_eq!(data, [0x36, 0x1b, 0xfe, 0x00]);
+        assert_eq!(data, [0x86, 0x80, 0x20, 0x70]);
         config.read(8, &mut data).unwrap();
         assert_eq!(data, [1, 0, 3, 0x0c]);
 
