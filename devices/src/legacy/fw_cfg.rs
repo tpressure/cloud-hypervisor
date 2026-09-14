@@ -128,9 +128,10 @@ pub const FW_CFG_ACPI_ID: &str = "QEMU0002";
 // Reserved (must be enabled)
 const FW_CFG_F_RESERVED: u8 = 1 << 0;
 const FW_CFG_F_DMA: u8 = 1 << 1;
-// We disable the broken DMA interface while the rework is in progress.
-// See https://github.com/cobaltcore-dev/cobaltcore/issues/647.
-pub const FW_CFG_FEATURE: [u8; 4] = [FW_CFG_F_RESERVED, 0, 0, 0];
+pub const FW_CFG_FEATURE: [u8; 4] = [FW_CFG_F_RESERVED | FW_CFG_F_DMA, 0, 0, 0];
+const FW_CFG_DMA_CHUNK_SIZE: usize = 4096;
+// Keep a single guest-controlled transfer from monopolizing the VMM thread.
+const FW_CFG_DMA_MAX_TRANSFER: u32 = 64 * 1024 * 1024;
 
 const COMMAND_ALLOCATE: u32 = 0x1;
 const COMMAND_ADD_POINTER: u32 = 0x2;
@@ -290,19 +291,13 @@ struct AccessControl {
     error: bool,
     // FW_CFG_DMA_CTL_READ = 0x02
     read: bool,
-    #[bits(1)]
-    _unused2: u8,
     // FW_CFG_DMA_CTL_SKIP = 0x04
     skip: bool,
-    #[bits(3)]
-    _unused3: u8,
-    // FW_CFG_DMA_CTL_ERROR = 0x08
+    // FW_CFG_DMA_CTL_SELECT = 0x08
     select: bool,
-    #[bits(7)]
-    _unused4: u8,
     // FW_CFG_DMA_CTL_WRITE = 0x10
     write: bool,
-    #[bits(16)]
+    #[bits(27)]
     _unused: u32,
 }
 
@@ -697,28 +692,50 @@ impl FwCfg {
         len: u32,
         address: u64,
     ) -> Result<u32> {
-        let content_size = content.size()?.saturating_sub(offset);
-        let op_size = std::cmp::min(content_size, len);
-        let mut access = content.access(offset);
-        let mut buf = vec![0u8; op_size as usize];
-        access.read_exact(buf.as_mut_bytes())?;
-        let r = self
-            .memory
-            .memory()
-            .write(buf.as_bytes(), GuestAddress(address));
-        match r {
-            Err(e) => {
-                error!("fw_cfg: dma read error: {e:x?}");
-                Err(ErrorKind::InvalidInput.into())
-            }
-            Ok(size) => Ok(size as u32),
+        if len > FW_CFG_DMA_MAX_TRANSFER {
+            return Err(ErrorKind::InvalidInput.into());
         }
+        address
+            .checked_add(u64::from(len))
+            .ok_or(ErrorKind::InvalidInput)?;
+        let available = content.size()?.saturating_sub(offset).min(len);
+        let mut transferred = 0u32;
+        let mut buffer = [0u8; FW_CFG_DMA_CHUNK_SIZE];
+        while transferred < len {
+            let chunk = (len - transferred).min(FW_CFG_DMA_CHUNK_SIZE as u32) as usize;
+            let from_content = available.saturating_sub(transferred).min(chunk as u32) as usize;
+            buffer[..chunk].fill(0);
+            if from_content != 0 {
+                let content_offset = offset
+                    .checked_add(transferred)
+                    .ok_or(ErrorKind::InvalidInput)?;
+                content
+                    .access(content_offset)
+                    .read_exact(&mut buffer[..from_content])?;
+            }
+            let guest_address = address
+                .checked_add(u64::from(transferred))
+                .ok_or(ErrorKind::InvalidInput)?;
+            let written = self
+                .memory
+                .memory()
+                .write(&buffer[..chunk], GuestAddress(guest_address))
+                .map_err(|_| ErrorKind::InvalidInput)?;
+            if written != chunk {
+                return Err(ErrorKind::InvalidInput.into());
+            }
+            transferred += chunk as u32;
+        }
+        Ok(available)
     }
 
     fn dma_read(&mut self, selector: u16, len: u32, address: u64) -> Result<()> {
         let op_size = if let Some(content) = self.known_items.get(selector as usize) {
             self.dma_read_content(content, self.data_offset, len, address)
-        } else if let Some(item) = self.items.get((selector - FW_CFG_FILE_FIRST) as usize) {
+        } else if let Some(item) = selector
+            .checked_sub(FW_CFG_FILE_FIRST)
+            .and_then(|index| self.items.get(index as usize))
+        {
             self.dma_read_content(&item.content, self.data_offset, len, address)
         } else {
             error!("fw_cfg: selector {selector:#x} does not exist.");
@@ -729,27 +746,29 @@ impl FwCfg {
     }
 
     fn do_dma(&mut self) {
-        // If the DMA bit is not set, then DMA is a no-op like Write from the traditional interface.
-        if (FW_CFG_FEATURE[0] & FW_CFG_F_DMA) == 0 {
-            return;
-        }
-
         let dma_address = self.dma_address;
+        self.dma_address = 0;
         let mut access = FwCfgDmaAccess::new_zeroed();
         let dma_access = match self
             .memory
             .memory()
             .read(access.as_mut_bytes(), GuestAddress(dma_address))
         {
-            Ok(_) => access,
+            Ok(size) if size == size_of::<FwCfgDmaAccess>() => access,
+            Ok(size) => {
+                error!("fw_cfg: truncated dma access at {dma_address:#x}: {size} bytes");
+                return;
+            }
             Err(e) => {
                 error!("fw_cfg: invalid address of dma access {dma_address:#x}: {e:?}");
                 return;
             }
         };
-        let control = AccessControl(u32::from_be(dma_access.control_be));
+        let control_value = u32::from_be(dma_access.control_be);
+        let control = AccessControl(control_value);
         if control.select() {
-            self.selector = control.select() as u16;
+            self.selector = (control_value >> 16) as u16;
+            self.data_offset = 0;
         }
         let len = u32::from_be(dma_access.length_be);
         let addr = u64::from_be(dma_access.address_be);
@@ -758,8 +777,10 @@ impl FwCfg {
         } else if control.write() {
             Err(ErrorKind::InvalidInput.into())
         } else if control.skip() {
-            self.data_offset += len;
-            Ok(())
+            self.data_offset
+                .checked_add(len)
+                .map(|next| self.data_offset = next)
+                .ok_or_else(|| ErrorKind::InvalidInput.into())
         } else {
             Err(ErrorKind::InvalidData.into())
         };
@@ -768,11 +789,13 @@ impl FwCfg {
             error!("fw_cfg: dma operation {dma_access:x?}: {e:x?}");
             access_resp.set_error(true);
         }
-        if let Err(e) = self.memory.memory().write(
+        match self.memory.memory().write(
             &access_resp.0.to_be_bytes(),
             GuestAddress(dma_address + core::mem::offset_of!(FwCfgDmaAccess, control_be) as u64),
         ) {
-            error!("fw_cfg: finishing dma: {e:?}");
+            Ok(4) => {}
+            Ok(size) => error!("fw_cfg: truncated dma completion: {size} bytes"),
+            Err(e) => error!("fw_cfg: finishing dma: {e:?}"),
         }
     }
 
@@ -982,14 +1005,10 @@ impl BusDevice for FwCfg {
             // support one-byte-length reads.
             (PORT_FW_CFG_DATA_OFFSET, _) => self.read_data(data),
             (PORT_FW_CFG_DMA_HI_OFFSET, 4) => {
-                let addr = self.dma_address;
-                let addr_hi = (addr >> 32) as u32;
-                data.copy_from_slice(&addr_hi.to_be_bytes());
+                data.copy_from_slice(&FW_CFG_DMA_SIGNATURE_CONTENT[..4]);
             }
             (PORT_FW_CFG_DMA_LO_OFFSET, 4) => {
-                let addr = self.dma_address;
-                let addr_lo = (addr & 0xffff_ffff) as u32;
-                data.copy_from_slice(&addr_lo.to_be_bytes());
+                data.copy_from_slice(&FW_CFG_DMA_SIGNATURE_CONTENT[4..]);
             }
             (offset, _) if qemu_mapped_offsets.any(|mapped_offset| mapped_offset == offset) => {
                 // We read from a port that should actually be mapped to fw_cfg. Note that QEMU
@@ -1389,8 +1408,8 @@ mod unit_tests {
         // access address is where to put the code
         let access_address = GuestAddress(load_addr.0);
         let address_bytes = access_address.0.to_be_bytes();
-        let dma_lo: [u8; 4] = address_bytes[0..4].try_into().unwrap();
-        let dma_hi: [u8; 4] = address_bytes[4..8].try_into().unwrap();
+        let dma_hi: [u8; 4] = address_bytes[0..4].try_into().unwrap();
+        let dma_lo: [u8; 4] = address_bytes[4..8].try_into().unwrap();
 
         // writing the FwCfgDmaAccess to mem (this would just be self.dma_access.as_ref() in guest)
         let _ = mem.write(access.as_mut_bytes(), access_address);
@@ -1412,13 +1431,49 @@ mod unit_tests {
             PORT_FW_CFG_SELECTOR_OFFSET,
             &[FW_CFG_FILE_FIRST as u8, 0],
         );
-        fw_cfg.write(0, PORT_FW_CFG_DMA_LO_OFFSET, &dma_lo);
         fw_cfg.write(0, PORT_FW_CFG_DMA_HI_OFFSET, &dma_hi);
+        fw_cfg.write(0, PORT_FW_CFG_DMA_LO_OFFSET, &dma_lo);
         let _ = mem.read(&mut data, GuestAddress(code_address));
+        assert_eq!(data, code);
+        assert_eq!(fw_cfg.data_offset, code.len() as u32);
+    }
 
-        // Assert that the DMA path is currently deactivated.
-        assert_eq!(data, [0u8; 12]);
-        assert_eq!(fw_cfg.data_offset, 0);
+    #[test]
+    fn test_dma_select_signature_and_eof() {
+        let memory: GuestMemoryMmap<AtomicBitmap> =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut fw_cfg = FwCfg::new(GuestMemoryAtomic::new(memory.clone()));
+        let mut signature = [0; 4];
+        fw_cfg.read(0, PORT_FW_CFG_DMA_HI_OFFSET, &mut signature);
+        assert_eq!(&signature, &FW_CFG_DMA_SIGNATURE_CONTENT[..4]);
+        fw_cfg.read(0, PORT_FW_CFG_DMA_LO_OFFSET, &mut signature);
+        assert_eq!(&signature, &FW_CFG_DMA_SIGNATURE_CONTENT[4..]);
+
+        let mut access = FwCfgDmaAccess {
+            control_be: ((u32::from(FW_CFG_SIGNATURE) << 16) | 0x0a).to_be(),
+            length_be: 8u32.to_be(),
+            address_be: 0x200u64.to_be(),
+        };
+        memory
+            .write(access.as_mut_bytes(), GuestAddress(0x100))
+            .unwrap();
+        fw_cfg.dma_address = 0x100;
+        fw_cfg.do_dma();
+        let mut result = [0xff; 8];
+        memory.read(&mut result, GuestAddress(0x200)).unwrap();
+        assert_eq!(&result, b"QEMU\0\0\0\0");
+        assert_eq!(fw_cfg.data_offset, 4);
+        assert_eq!(fw_cfg.dma_address, 0);
+
+        access.control_be = ((u32::from(FW_CFG_FILE_FIRST) << 16) | 0x0a).to_be();
+        memory
+            .write(access.as_mut_bytes(), GuestAddress(0x100))
+            .unwrap();
+        fw_cfg.dma_address = 0x100;
+        fw_cfg.do_dma();
+        let mut control = [0; 4];
+        memory.read(&mut control, GuestAddress(0x100)).unwrap();
+        assert_eq!(u32::from_be_bytes(control) & 1, 1);
     }
 
     #[test]
