@@ -143,6 +143,8 @@ const ALLOC_ZONE_FSEG: u8 = 0x2;
 const FW_CFG_FILENAME_TABLE_LOADER: &str = "etc/table-loader";
 const FW_CFG_FILENAME_RSDP: &str = "acpi/rsdp";
 const FW_CFG_FILENAME_ACPI_TABLES: &str = "acpi/tables";
+const RAMFB_CONFIG_SIZE: usize = 28;
+const RAMFB_FILENAME: &str = "etc/ramfb";
 
 #[cfg(target_arch = "x86_64")]
 /// https://www.kernel.org/doc/html/latest/arch/x86/boot.html#the-real-mode-kernel-header
@@ -526,14 +528,29 @@ impl FwCfg {
         let mut known_items = [DEFAULT_ITEM; FW_CFG_KNOWN_ITEMS];
         known_items[FW_CFG_SIGNATURE as usize] = FwCfgContent::Slice(&FW_CFG_SIGNATURE_CONTENT);
         known_items[FW_CFG_ID as usize] = FwCfgContent::Slice(&FW_CFG_FEATURE);
-        let file_buf = Vec::from(FwCfgFilesHeader { count_be: 0 }.as_mut_bytes());
+        let mut file_buf = Vec::from(
+            FwCfgFilesHeader {
+                count_be: 1u32.to_be(),
+            }
+            .as_mut_bytes(),
+        );
+        let mut ramfb_file = FwCfgFile {
+            size_be: (RAMFB_CONFIG_SIZE as u32).to_be(),
+            select_be: FW_CFG_FILE_FIRST.to_be(),
+            _reserved: 0,
+            name: create_file_name(RAMFB_FILENAME),
+        };
+        file_buf.extend_from_slice(ramfb_file.as_mut_bytes());
         known_items[FW_CFG_FILE_DIR as usize] = FwCfgContent::Bytes(file_buf);
 
         FwCfg {
             selector: 0,
             data_offset: 0,
             dma_address: 0,
-            items: vec![],
+            items: vec![FwCfgItem {
+                name: RAMFB_FILENAME.to_owned(),
+                content: FwCfgContent::Bytes(vec![0; RAMFB_CONFIG_SIZE]),
+            }],
             known_items,
             memory,
         }
@@ -745,6 +762,39 @@ impl FwCfg {
         Ok(())
     }
 
+    fn dma_write(&mut self, selector: u16, len: u32, address: u64) -> Result<()> {
+        if selector != FW_CFG_FILE_FIRST {
+            return Err(ErrorKind::PermissionDenied.into());
+        }
+        let Some(FwCfgItem {
+            content: FwCfgContent::Bytes(bytes),
+            ..
+        }) = self.items.first_mut()
+        else {
+            return Err(ErrorKind::InvalidInput.into());
+        };
+        let start = usize::try_from(self.data_offset).map_err(|_| ErrorKind::InvalidInput)?;
+        let size = usize::try_from(len).map_err(|_| ErrorKind::InvalidInput)?;
+        let end = start.checked_add(size).ok_or(ErrorKind::InvalidInput)?;
+        bytes.get(start..end).ok_or(ErrorKind::InvalidInput)?;
+        address
+            .checked_add(u64::from(len))
+            .ok_or(ErrorKind::InvalidInput)?;
+
+        let mut buffer = [0u8; RAMFB_CONFIG_SIZE];
+        let read = self
+            .memory
+            .memory()
+            .read(&mut buffer[..size], GuestAddress(address))
+            .map_err(|_| ErrorKind::InvalidInput)?;
+        if read != size {
+            return Err(ErrorKind::InvalidInput.into());
+        }
+        bytes[start..end].copy_from_slice(&buffer[..size]);
+        self.data_offset = end as u32;
+        Ok(())
+    }
+
     fn do_dma(&mut self) {
         let dma_address = self.dma_address;
         self.dma_address = 0;
@@ -775,7 +825,7 @@ impl FwCfg {
         let ret = if control.read() {
             self.dma_read(self.selector, len, addr)
         } else if control.write() {
-            Err(ErrorKind::InvalidInput.into())
+            self.dma_write(self.selector, len, addr)
         } else if control.skip() {
             self.data_offset
                 .checked_add(len)
@@ -1374,7 +1424,11 @@ mod unit_tests {
         };
         fw_cfg.add_item(item).unwrap();
 
-        assert_legacy_selector_read(&mut fw_cfg, FW_CFG_FILE_FIRST, expected_bytes.as_bytes());
+        assert_legacy_selector_read(
+            &mut fw_cfg,
+            FW_CFG_FILE_FIRST + 1,
+            expected_bytes.as_bytes(),
+        );
     }
 
     #[test]
@@ -1429,7 +1483,7 @@ mod unit_tests {
         fw_cfg.write(
             0,
             PORT_FW_CFG_SELECTOR_OFFSET,
-            &[FW_CFG_FILE_FIRST as u8, 0],
+            &[(FW_CFG_FILE_FIRST + 1) as u8, 0],
         );
         fw_cfg.write(0, PORT_FW_CFG_DMA_HI_OFFSET, &dma_hi);
         fw_cfg.write(0, PORT_FW_CFG_DMA_LO_OFFSET, &dma_lo);
@@ -1465,7 +1519,7 @@ mod unit_tests {
         assert_eq!(fw_cfg.data_offset, 4);
         assert_eq!(fw_cfg.dma_address, 0);
 
-        access.control_be = ((u32::from(FW_CFG_FILE_FIRST) << 16) | 0x0a).to_be();
+        access.control_be = ((u32::from(FW_CFG_FILE_FIRST + 1) << 16) | 0x0a).to_be();
         memory
             .write(access.as_mut_bytes(), GuestAddress(0x100))
             .unwrap();
@@ -1474,6 +1528,52 @@ mod unit_tests {
         let mut control = [0; 4];
         memory.read(&mut control, GuestAddress(0x100)).unwrap();
         assert_eq!(u32::from_be_bytes(control) & 1, 1);
+    }
+
+    #[test]
+    fn test_ramfb_file_and_bounded_dma_write() {
+        let memory: GuestMemoryMmap<AtomicBitmap> =
+            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let mut fw_cfg = FwCfg::new(GuestMemoryAtomic::new(memory.clone()));
+        assert_eq!(fw_cfg.items[0].name, RAMFB_FILENAME);
+        assert_eq!(
+            fw_cfg.items[0].content.size().unwrap(),
+            RAMFB_CONFIG_SIZE as u32
+        );
+        let FwCfgContent::Bytes(directory) = &fw_cfg.known_items[FW_CFG_FILE_DIR as usize] else {
+            panic!("file directory must be bytes");
+        };
+        assert_eq!(u32::from_be_bytes(directory[..4].try_into().unwrap()), 1);
+        assert_eq!(&directory[12..21], RAMFB_FILENAME.as_bytes());
+
+        let payload = [0x5a; RAMFB_CONFIG_SIZE];
+        memory.write(&payload, GuestAddress(0x200)).unwrap();
+        let mut access = FwCfgDmaAccess {
+            control_be: ((u32::from(FW_CFG_FILE_FIRST) << 16) | 0x18).to_be(),
+            length_be: (RAMFB_CONFIG_SIZE as u32).to_be(),
+            address_be: 0x200u64.to_be(),
+        };
+        memory
+            .write(access.as_mut_bytes(), GuestAddress(0x100))
+            .unwrap();
+        fw_cfg.dma_address = 0x100;
+        fw_cfg.do_dma();
+        let FwCfgContent::Bytes(bytes) = &fw_cfg.items[0].content else {
+            panic!("RAMFB must be writable bytes");
+        };
+        assert_eq!(bytes, &payload);
+        assert_eq!(fw_cfg.data_offset, RAMFB_CONFIG_SIZE as u32);
+
+        access.length_be = ((RAMFB_CONFIG_SIZE + 1) as u32).to_be();
+        memory
+            .write(access.as_mut_bytes(), GuestAddress(0x100))
+            .unwrap();
+        fw_cfg.dma_address = 0x100;
+        fw_cfg.do_dma();
+        let mut control = [0u8; 4];
+        memory.read(&mut control, GuestAddress(0x100)).unwrap();
+        assert_eq!(u32::from_be_bytes(control) & 1, 1);
+        assert_eq!(fw_cfg.data_offset, 0);
     }
 
     #[test]
@@ -1599,7 +1699,11 @@ mod unit_tests {
 
         // Read the same bytes twice, demonstrating that we can reset the cursor by selecting a new item.
         for _ in 0..2 {
-            assert_legacy_selector_read(&mut fw_cfg, FW_CFG_FILE_FIRST, payload_bytes.as_bytes());
+            assert_legacy_selector_read(
+                &mut fw_cfg,
+                FW_CFG_FILE_FIRST + 1,
+                payload_bytes.as_bytes(),
+            );
         }
     }
 }
